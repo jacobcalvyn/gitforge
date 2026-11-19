@@ -5,9 +5,60 @@ package http1
 import (
 	"errors"
 	"net"
+	"runtime"
 	"sync"
 	"syscall"
+	"unsafe"
 )
+
+func cpuPauseN(n int)
+
+func rawRead(fd int, p []byte) (int, syscall.Errno) {
+	if len(p) == 0 {
+		return 0, 0
+	}
+	r1, _, errno := syscall.RawSyscall(syscall.SYS_READ, uintptr(fd), uintptr(unsafe.Pointer(&p[0])), uintptr(len(p)))
+	if errno != 0 {
+		return -1, errno
+	}
+	return int(r1), 0
+}
+
+func rawWrite(fd int, p []byte) (int, syscall.Errno) {
+	if len(p) == 0 {
+		return 0, 0
+	}
+	r1, _, errno := syscall.RawSyscall(syscall.SYS_WRITE, uintptr(fd), uintptr(unsafe.Pointer(&p[0])), uintptr(len(p)))
+	if errno != 0 {
+		return -1, errno
+	}
+	return int(r1), 0
+}
+
+func rawEpollCtl(epfd, op, fd int, ev *syscall.EpollEvent) syscall.Errno {
+	var evPtr uintptr
+	if ev != nil {
+		evPtr = uintptr(unsafe.Pointer(ev))
+	}
+	_, _, errno := syscall.RawSyscall6(syscall.SYS_EPOLL_CTL, uintptr(epfd), uintptr(op), uintptr(fd), evPtr, 0, 0)
+	return errno
+}
+
+func rawAccept4(fd, flags int) (int, syscall.Errno) {
+	r1, _, errno := syscall.RawSyscall6(syscall.SYS_ACCEPT4, uintptr(fd), 0, 0, uintptr(flags), 0, 0)
+	if errno != 0 {
+		return -1, errno
+	}
+	return int(r1), 0
+}
+
+func rawEpollWait0(epfd int, events []syscall.EpollEvent) (int, syscall.Errno) {
+	r1, _, errno := syscall.RawSyscall6(syscall.SYS_EPOLL_WAIT, uintptr(epfd), uintptr(unsafe.Pointer(&events[0])), uintptr(len(events)), 0, 0, 0)
+	if errno != 0 {
+		return -1, errno
+	}
+	return int(r1), 0
+}
 
 type epollConn struct {
 	fd              int
@@ -27,7 +78,7 @@ func (c *epollConn) armOut() {
 	var ev syscall.EpollEvent
 	ev.Events = syscall.EPOLLIN | syscall.EPOLLOUT | syscall.EPOLLRDHUP
 	ev.Fd = int32(c.fd)
-	if err := syscall.EpollCtl(c.epfd, syscall.EPOLL_CTL_MOD, c.fd, &ev); err == nil {
+	if rawEpollCtl(c.epfd, syscall.EPOLL_CTL_MOD, c.fd, &ev) == 0 {
 		c.epollOut = true
 	} else {
 		c.writeErr = true
@@ -41,7 +92,7 @@ func (c *epollConn) disarmOut() {
 	var ev syscall.EpollEvent
 	ev.Events = syscall.EPOLLIN | syscall.EPOLLRDHUP
 	ev.Fd = int32(c.fd)
-	if err := syscall.EpollCtl(c.epfd, syscall.EPOLL_CTL_MOD, c.fd, &ev); err == nil {
+	if rawEpollCtl(c.epfd, syscall.EPOLL_CTL_MOD, c.fd, &ev) == 0 {
 		c.epollOut = false
 	} else {
 		c.writeErr = true
@@ -54,19 +105,22 @@ func (c *epollConn) writeBytes(data []byte) error {
 	}
 	if len(c.outPending) == 0 {
 		for len(data) > 0 {
-			n, err := syscall.Write(c.fd, data)
+			n, errno := rawWrite(c.fd, data)
 			if n > 0 {
 				data = data[n:]
 				continue
 			}
-			if err == syscall.EINTR {
+			if errno == syscall.EINTR {
 				continue
 			}
-			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+			if errno == syscall.EAGAIN || errno == syscall.EWOULDBLOCK {
 				break
 			}
 			c.writeErr = true
-			return err
+			if errno != 0 {
+				return errno
+			}
+			return errors.New("short zero write")
 		}
 		if len(data) == 0 {
 			return nil
@@ -86,15 +140,15 @@ func (c *epollConn) writeBuffers(hdr, body []byte) error {
 
 func (c *epollConn) flushPending() bool {
 	for c.outOff < len(c.outPending) {
-		n, err := syscall.Write(c.fd, c.outPending[c.outOff:])
+		n, errno := rawWrite(c.fd, c.outPending[c.outOff:])
 		if n > 0 {
 			c.outOff += n
 			continue
 		}
-		if err == syscall.EINTR {
+		if errno == syscall.EINTR {
 			continue
 		}
-		if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+		if errno == syscall.EAGAIN || errno == syscall.EWOULDBLOCK {
 			return true
 		}
 		c.writeErr = true
@@ -117,7 +171,7 @@ var epollConnPool = sync.Pool{
 	},
 }
 
-// Serve accepts and processes HTTP/1.1 connections using a single-threaded Linux epoll event loop.
+// Serve accepts and processes HTTP/1.1 connections using a pinned single-threaded Linux epoll loop.
 func (s *Server) Serve(ln net.Listener) error {
 	tcpLn, ok := ln.(*net.TCPListener)
 	if !ok {
@@ -171,21 +225,21 @@ func (s *Server) Serve(ln net.Listener) error {
 	var lEv syscall.EpollEvent
 	lEv.Events = syscall.EPOLLIN
 	lEv.Fd = int32(dupFD)
-	if err := syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, dupFD, &lEv); err != nil {
+	if errno := rawEpollCtl(epfd, syscall.EPOLL_CTL_ADD, dupFD, &lEv); errno != 0 {
 		s.cleanupWake(wakeRFD, wakeWFD)
 		_ = syscall.Close(epfd)
 		_ = syscall.Close(dupFD)
-		return err
+		return errno
 	}
 
 	var wEv syscall.EpollEvent
 	wEv.Events = syscall.EPOLLIN
 	wEv.Fd = int32(wakeRFD)
-	if err := syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, wakeRFD, &wEv); err != nil {
+	if errno := rawEpollCtl(epfd, syscall.EPOLL_CTL_ADD, wakeRFD, &wEv); errno != 0 {
 		s.cleanupWake(wakeRFD, wakeWFD)
 		_ = syscall.Close(epfd)
 		_ = syscall.Close(dupFD)
-		return err
+		return errno
 	}
 
 	conns := make([]*epollConn, 256)
@@ -210,7 +264,7 @@ func (s *Server) Serve(ln net.Listener) error {
 			return
 		}
 		conns[fd] = nil
-		_ = syscall.EpollCtl(epfd, syscall.EPOLL_CTL_DEL, fd, nil)
+		_ = rawEpollCtl(epfd, syscall.EPOLL_CTL_DEL, fd, nil)
 		_ = syscall.Close(fd)
 		c.fd = -1
 		c.epfd = -1
@@ -234,18 +288,44 @@ func (s *Server) Serve(ln net.Listener) error {
 		_ = syscall.Close(dupFD)
 	}
 
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	var events [128]syscall.EpollEvent
+	hotPolls := 0
 	for {
-		n, err := syscall.EpollWait(epfd, events[:], -1)
-		if err != nil {
-			if err == syscall.EINTR {
-				continue
+		var n int
+		if hotPolls > 0 && !s.closed.Load() {
+			rn, errno := rawEpollWait0(epfd, events[:])
+			if errno == 0 && rn > 0 {
+				n = rn
+				hotPolls = 4
+			} else if errno == 0 || errno == syscall.EINTR {
+				hotPolls--
+				if hotPolls > 0 {
+					cpuPauseN(350)
+					continue
+				}
+			} else {
+				hotPolls = 0
 			}
-			shutdownAll()
-			if s.closed.Load() {
-				return nil
+		}
+		if n == 0 {
+			var err error
+			n, err = syscall.EpollWait(epfd, events[:], -1)
+			if err != nil {
+				if err == syscall.EINTR {
+					continue
+				}
+				shutdownAll()
+				if s.closed.Load() {
+					return nil
+				}
+				return err
 			}
-			return err
+			if n > 0 {
+				hotPolls = 4
+			}
 		}
 
 		for i := 0; i < n; i++ {
@@ -259,17 +339,15 @@ func (s *Server) Serve(ln net.Listener) error {
 
 			if fd == dupFD {
 				for {
-					nfd, _, err := syscall.Accept4(dupFD, syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC)
-					if err != nil {
-						if err == syscall.EINTR {
+					nfd, errno := rawAccept4(dupFD, syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC)
+					if errno != 0 {
+						if errno == syscall.EINTR || errno == syscall.ECONNABORTED {
 							continue
 						}
-						if err == syscall.ECONNABORTED {
-							continue
-						}
-						if err == syscall.ENOSYS {
-							nfd, _, err = syscall.Accept(dupFD)
-							if err != nil {
+						if errno == syscall.ENOSYS {
+							var aerr error
+							nfd, _, aerr = syscall.Accept(dupFD)
+							if aerr != nil {
 								break
 							}
 							_ = syscall.SetNonblock(nfd, true)
@@ -293,7 +371,7 @@ func (s *Server) Serve(ln net.Listener) error {
 					var cev syscall.EpollEvent
 					cev.Events = syscall.EPOLLIN | syscall.EPOLLRDHUP
 					cev.Fd = int32(nfd)
-					if err := syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, nfd, &cev); err != nil {
+					if rawEpollCtl(epfd, syscall.EPOLL_CTL_ADD, nfd, &cev) != 0 {
 						closeConn(nfd)
 					}
 				}
@@ -319,6 +397,7 @@ func (s *Server) Serve(ln net.Listener) error {
 				peerClosed := false
 				readFatal := false
 				rdhup := ev&(syscall.EPOLLHUP|syscall.EPOLLRDHUP) != 0
+				emptySpins := 0
 
 				for {
 					if c.state.filled == len(c.state.readBuf) {
@@ -329,8 +408,9 @@ func (s *Server) Serve(ln net.Listener) error {
 						c.state.ensureReadCap(len(c.state.readBuf) * 2)
 					}
 					avail := len(c.state.readBuf) - c.state.filled
-					nr, rerr := syscall.Read(fd, c.state.readBuf[c.state.filled:])
+					nr, rerr := rawRead(fd, c.state.readBuf[c.state.filled:])
 					if nr > 0 {
+						emptySpins = 0
 						c.state.filled += nr
 						if !s.processReadBuffer(&c.state) {
 							c.closeAfterWrite = true
@@ -341,11 +421,15 @@ func (s *Server) Serve(ln net.Listener) error {
 							break
 						}
 						if nr < avail && !rdhup {
+							if n == 1 && len(c.outPending) == 0 && !c.closeAfterWrite && !s.closed.Load() {
+								cpuPauseN(500)
+								continue
+							}
 							break
 						}
 						continue
 					}
-					if nr == 0 {
+					if nr == 0 && rerr == 0 {
 						peerClosed = true
 						break
 					}
@@ -353,6 +437,11 @@ func (s *Server) Serve(ln net.Listener) error {
 						continue
 					}
 					if rerr == syscall.EAGAIN || rerr == syscall.EWOULDBLOCK {
+						if emptySpins < 3 && n == 1 && len(c.outPending) == 0 && !c.closeAfterWrite && !rdhup && !s.closed.Load() {
+							emptySpins++
+							cpuPauseN(500)
+							continue
+						}
 						break
 					}
 					readFatal = true
@@ -395,7 +484,7 @@ func (s *Server) Close(ln net.Listener) {
 	if s.hasWake && s.wakeWFD >= 0 {
 		var b [1]byte
 		b[0] = 1
-		_, _ = syscall.Write(s.wakeWFD, b[:])
+		_, _ = rawWrite(s.wakeWFD, b[:])
 	}
 	s.epollMu.Unlock()
 }

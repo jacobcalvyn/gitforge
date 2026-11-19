@@ -3,6 +3,8 @@ import { accessSync, chmodSync, constants, copyFileSync, existsSync } from 'node
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+process.env.UV_THREADPOOL_SIZE = '1';
+
 const rootDir = dirname(fileURLToPath(import.meta.url));
 
 function selectBinaryName(): string {
@@ -34,7 +36,7 @@ function launch(): void {
   const binPath = resolveExecutable(join(rootDir, selectBinaryName()));
   const extraArgs = process.argv.slice(2);
   let child = spawn(binPath, extraArgs, {
-    stdio: 'inherit',
+    stdio: ['ignore', 'inherit', 'inherit'],
     env: process.env,
   });
 
@@ -53,7 +55,7 @@ function launch(): void {
         const tmpBin = '/tmp/gitforge-bin';
         copyFileSync(join(rootDir, selectBinaryName()), tmpBin);
         chmodSync(tmpBin, 0o755);
-        child = spawn(tmpBin, extraArgs, { stdio: 'inherit', env: process.env });
+        child = spawn(tmpBin, extraArgs, { stdio: ['ignore', 'inherit', 'inherit'], env: process.env });
         child.on('exit', (code, signal) => {
           process.exit(code ?? (signal ? 1 : 0));
         });

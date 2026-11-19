@@ -7,7 +7,6 @@ import (
 	"path"
 	"strconv"
 	"strings"
-	"time"
 
 	"gitforge/internal/git"
 	"gitforge/internal/http1"
@@ -321,7 +320,7 @@ func handleRepoSub(w *http1.ResponseWriter, r *http1.Request, st *store.Store, r
 				repo.InvalidateGitCaches()
 				repo.GitMu.Unlock()
 			}
-			repo.UpdatedAt = time.Now().UTC().Format("2006-01-02T15:04:05Z")
+			repo.UpdatedAt = store.NowISO()
 			repo.DataMu.Unlock()
 			writeJSONVal(w, 200, repoJSON(repo))
 		case "DELETE":
@@ -955,56 +954,55 @@ func scanPlainJSONString(b []byte, i int) (s []byte, next int, ok bool) {
 	return nil, i, false
 }
 
-func parseCreateIssueFast(body []byte) (title, issueBody string, ok bool) {
+func parseCreateIssueFast(body []byte) (titleBytes, bodyBytes []byte, ok bool) {
 	i := skipJSONWS(body, 0)
 	if i >= len(body) || body[i] != '{' {
-		return "", "", false
+		return nil, nil, false
 	}
 	i = skipJSONWS(body, i+1)
 	if i >= len(body) {
-		return "", "", false
+		return nil, nil, false
 	}
-	var tBytes, bBytes []byte
 	var seenTitle, seenBody bool
 
 	if body[i] == '}' {
 		i = skipJSONWS(body, i+1)
-		return "", "", i == len(body)
+		return nil, nil, i == len(body)
 	}
 
 	for {
 		key, next, okKey := scanPlainJSONString(body, i)
 		if !okKey {
-			return "", "", false
+			return nil, nil, false
 		}
 		i = skipJSONWS(body, next)
 		if i >= len(body) || body[i] != ':' {
-			return "", "", false
+			return nil, nil, false
 		}
 		i = skipJSONWS(body, i+1)
 		val, nextVal, okVal := scanPlainJSONString(body, i)
 		if !okVal {
-			return "", "", false
+			return nil, nil, false
 		}
 		if bytes.Equal(key, []byte("title")) {
 			if seenTitle {
-				return "", "", false
+				return nil, nil, false
 			}
 			seenTitle = true
-			tBytes = val
+			titleBytes = val
 		} else if bytes.Equal(key, []byte("body")) {
 			if seenBody {
-				return "", "", false
+				return nil, nil, false
 			}
 			seenBody = true
-			bBytes = val
+			bodyBytes = val
 		} else {
-			return "", "", false
+			return nil, nil, false
 		}
 
 		i = skipJSONWS(body, nextVal)
 		if i >= len(body) {
-			return "", "", false
+			return nil, nil, false
 		}
 		if body[i] == ',' {
 			i = skipJSONWS(body, i+1)
@@ -1013,44 +1011,23 @@ func parseCreateIssueFast(body []byte) (title, issueBody string, ok bool) {
 		if body[i] == '}' {
 			i = skipJSONWS(body, i+1)
 			if i != len(body) {
-				return "", "", false
+				return nil, nil, false
 			}
 			break
 		}
-		return "", "", false
+		return nil, nil, false
 	}
 
-	tLen := len(tBytes)
-	total := tLen + len(bBytes)
-	if total == 0 {
-		return "", "", true
-	}
-	var combined string
-	var stack [2048]byte
-	if total <= len(stack) {
-		copy(stack[:tLen], tBytes)
-		copy(stack[tLen:total], bBytes)
-		combined = string(stack[:total])
-	} else {
-		buf := make([]byte, total)
-		copy(buf[:tLen], tBytes)
-		copy(buf[tLen:], bBytes)
-		combined = string(buf)
-	}
-	return combined[:tLen], combined[tLen:], true
+	return titleBytes, bodyBytes, true
 }
 
 func handleCreateIssueFast(w *http1.ResponseWriter, r *http1.Request, st *store.Store, repo *store.Repo) {
-	title, issueBody, ok := parseCreateIssueFast(r.Body)
+	titleBytes, bodyBytes, ok := parseCreateIssueFast(r.Body)
 	if !ok {
 		handleCreateIssue(w, r, st, repo)
 		return
 	}
-	iss, err := st.CreateIssue(repo, title, issueBody, nil)
-	if err != nil {
-		writeErr(w, 422, "Validation Failed: "+err.Error())
-		return
-	}
+	iss := st.CreateIssueBytes(repo, titleBytes, bodyBytes)
 	_ = w.WriteJSONBuild(201, func(dst []byte) []byte {
 		dst = store.MarshalIssueJSON(iss, dst)
 		return append(dst, '\n')
@@ -1469,7 +1446,7 @@ func MergePullRequest(repo *store.Repo, pr *store.PullRequest, method, commitMsg
 	repo.GitMu.Unlock()
 
 	shaHex = git.FormatOID(mergeCommitOID)
-	now := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	now := store.NowISO()
 	repo.DataMu.Lock()
 	pr.Merged = true
 	pr.State = "closed"

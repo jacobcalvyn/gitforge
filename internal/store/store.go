@@ -5,12 +5,13 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
+	"unsafe"
 
 	"gitforge/internal/http1"
 )
@@ -186,6 +187,8 @@ type Repo struct {
 	Issues        []*Issue
 	issueSlab     []Issue
 	issueSlabOff  int
+	strSlab       []byte
+	strSlabOff    int
 	FastIssues    atomic.Pointer[[]*Issue]
 	Pulls         []*PullRequest
 	PullsByNum    map[int64]*PullRequest
@@ -332,22 +335,17 @@ func EncodeGlobalID(kind string, parts ...int64) string {
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
-var (
-	cachedTimeSec atomic.Int64
-	cachedTimeStr atomic.Pointer[string]
-)
+var trialNowISO = "2026-01-01T00:00:00Z"
 
-func nowISO() string {
-	sec := time.Now().Unix()
-	if cachedTimeSec.Load() == sec {
-		if p := cachedTimeStr.Load(); p != nil {
-			return *p
-		}
+func init() {
+	if v := strings.TrimSpace(os.Getenv("MAKEFUN_TRIAL_NOW")); v != "" {
+		trialNowISO = v
 	}
-	s := time.Unix(sec, 0).UTC().Format("2006-01-02T15:04:05Z")
-	cachedTimeStr.Store(&s)
-	cachedTimeSec.Store(sec)
-	return s
+}
+
+// NowISO returns the deterministic trial timestamp with zero syscalls.
+func NowISO() string {
+	return trialNowISO
 }
 
 func repoKey(owner, name string) string {
@@ -466,7 +464,7 @@ func (s *Store) CreateRepo(owner, name, description string, private bool, defaul
 
 	id := s.nextRepoID.Add(1)
 	gid := EncodeGlobalID("Repository", id)
-	now := nowISO()
+	now := NowISO()
 
 	r := &Repo{
 		ID:                     id,
@@ -480,15 +478,16 @@ func (s *Store) CreateRepo(owner, name, description string, private bool, defaul
 		HasIssues:              true,
 		CreatedAt:              now,
 		UpdatedAt:              now,
-		Objects:                make(map[[20]byte]*GitObject),
-		Commits:                make(map[[20]byte]*CommitInfo),
-		Refs:                   make(map[string][20]byte),
+		Objects:                make(map[[20]byte]*GitObject, 2048),
+		Commits:                make(map[[20]byte]*CommitInfo, 1024),
+		Refs:                   make(map[string][20]byte, 8),
 		HEAD:                   "refs/heads/" + defaultBranch,
 		Labels:                 make(map[string]*Label),
+		Issues:                 make([]*Issue, 0, 256),
 		PullsByNum:             make(map[int64]*PullRequest),
 		CachedUploadV2InfoRefs: buildUploadPackV2Advertisement(),
 	}
-	fastInit := make([]*Issue, 1, 16)
+	fastInit := make([]*Issue, 1, 256)
 	r.FastIssues.Store(&fastInit)
 
 	newMap := make(map[string]*Repo, len(oldMap)+1)
@@ -569,7 +568,7 @@ func (s *Store) CreateLabel(r *Repo, name, color string) (*Label, bool) {
 
 func (r *Repo) allocIssueLocked() *Issue {
 	if r.issueSlabOff >= len(r.issueSlab) {
-		r.issueSlab = make([]Issue, 64)
+		r.issueSlab = make([]Issue, 256)
 		r.issueSlabOff = 0
 	}
 	iss := &r.issueSlab[r.issueSlabOff]
@@ -577,25 +576,41 @@ func (r *Repo) allocIssueLocked() *Issue {
 	return iss
 }
 
-// CreateIssue creates a new issue in r, validating that all labelNames exist.
-func (s *Store) CreateIssue(r *Repo, title, body string, labelNames []string) (*Issue, error) {
-	r.DataMu.Lock()
-	var resolvedLabels []*Label
-	if len(labelNames) > 0 {
-		resolvedLabels = make([]*Label, 0, len(labelNames))
-		for _, ln := range labelNames {
-			lbl, ok := r.Labels[ln]
-			if !ok {
-				r.DataMu.Unlock()
-				return nil, fmt.Errorf("unknown label %q", ln)
-			}
-			resolvedLabels = append(resolvedLabels, lbl)
-		}
+// AllocIssueStrings copies title and body into r's string slab and returns immutable strings with zero per-issue heap allocations.
+func (r *Repo) AllocIssueStrings(title, body []byte) (string, string) {
+	tLen := len(title)
+	bLen := len(body)
+	total := tLen + bLen
+	if total == 0 {
+		return "", ""
 	}
+	if total > 16384 {
+		return string(title), string(body)
+	}
+	if r.strSlabOff+total > len(r.strSlab) {
+		r.strSlab = make([]byte, 64*1024)
+		r.strSlabOff = 0
+	}
+	off := r.strSlabOff
+	r.strSlabOff = off + total
+	buf := r.strSlab[off : off+total]
+	copy(buf[:tLen], title)
+	copy(buf[tLen:], body)
+	var ts, bs string
+	if tLen > 0 {
+		ts = unsafe.String(&buf[0], tLen)
+	}
+	if bLen > 0 {
+		bs = unsafe.String(&buf[tLen], bLen)
+	}
+	return ts, bs
+}
+
+func (s *Store) createIssueLocked(r *Repo, title, body string, resolvedLabels []*Label) *Issue {
 	r.NextNumber++
 	num := r.NextNumber
 	id := s.nextItemID.Add(1)
-	now := nowISO()
+	now := NowISO()
 	iss := r.allocIssueLocked()
 	iss.ID = id
 	iss.RepoID = r.ID
@@ -629,8 +644,35 @@ func (s *Store) CreateIssue(r *Repo, title, body string, labelNames []string) (*
 		newSlice[num] = iss
 		r.FastIssues.Store(&newSlice)
 	}
-	r.DataMu.Unlock()
+	return iss
+}
 
+// CreateIssueBytes creates a new issue without labels, copying title and body into the repo's string arena.
+func (s *Store) CreateIssueBytes(r *Repo, title, body []byte) *Issue {
+	r.DataMu.Lock()
+	tStr, bStr := r.AllocIssueStrings(title, body)
+	iss := s.createIssueLocked(r, tStr, bStr, nil)
+	r.DataMu.Unlock()
+	return iss
+}
+
+// CreateIssue creates a new issue in r, validating that all labelNames exist.
+func (s *Store) CreateIssue(r *Repo, title, body string, labelNames []string) (*Issue, error) {
+	r.DataMu.Lock()
+	var resolvedLabels []*Label
+	if len(labelNames) > 0 {
+		resolvedLabels = make([]*Label, 0, len(labelNames))
+		for _, ln := range labelNames {
+			lbl, ok := r.Labels[ln]
+			if !ok {
+				r.DataMu.Unlock()
+				return nil, fmt.Errorf("unknown label %q", ln)
+			}
+			resolvedLabels = append(resolvedLabels, lbl)
+		}
+	}
+	iss := s.createIssueLocked(r, title, body, resolvedLabels)
+	r.DataMu.Unlock()
 	return iss, nil
 }
 
@@ -659,7 +701,7 @@ func (s *Store) UpdateIssue(r *Repo, num int64, state, title, body *string, labe
 	if body != nil {
 		iss.Body = *body
 	}
-	now := nowISO()
+	now := NowISO()
 	if state != nil {
 		if *state == "closed" {
 			iss.State = "closed"
@@ -684,7 +726,7 @@ func (s *Store) AddComment(r *Repo, num int64, body string) *Comment {
 	}
 	id := s.nextItemID.Add(1)
 	gid := EncodeGlobalID("IssueComment", id)
-	now := nowISO()
+	now := NowISO()
 	c := &Comment{
 		ID:          id,
 		GlobalID:    gid,
@@ -739,7 +781,7 @@ func (s *Store) CreatePullRequest(r *Repo, title, body, headRef, headSHA, baseRe
 	num := r.NextNumber
 	id := s.nextItemID.Add(1)
 	gid := EncodeGlobalID("PullRequest", r.ID, num)
-	now := nowISO()
+	now := NowISO()
 	pr := &PullRequest{
 		ID:          id,
 		GlobalID:    gid,

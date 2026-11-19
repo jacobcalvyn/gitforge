@@ -2,11 +2,13 @@ package git
 
 import (
 	"bytes"
+	"compress/flate"
 	"compress/zlib"
+	"crypto/sha1"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash"
+	"hash/adler32"
 	"io"
 	"sync"
 
@@ -22,6 +24,12 @@ var zlibReaderPool = sync.Pool{
 			return nil
 		}
 		return r
+	},
+}
+
+var flateReaderPool = sync.Pool{
+	New: func() any {
+		return flate.NewReader(&sliceReader{})
 	},
 }
 
@@ -107,6 +115,56 @@ func readOfsDeltaOffset(buf []byte, off int) (back int, next int, err error) {
 }
 
 func inflatePackEntryInto(r *store.Repo, data []byte, expectedSize int) (out []byte, consumed int, err error) {
+	if len(data) >= 6 {
+		cmf := data[0]
+		flg := data[1]
+		if cmf&0x0f == 8 && cmf>>4 <= 7 && ((uint16(cmf)<<8)|uint16(flg))%31 == 0 && flg&0x20 == 0 {
+			sr := sliceReader{b: data[2:]}
+			var fr io.ReadCloser
+			if pooled := flateReaderPool.Get(); pooled != nil {
+				fr = pooled.(io.ReadCloser)
+				if err = fr.(flate.Resetter).Reset(&sr, nil); err != nil {
+					_ = fr.Close()
+					fr = flate.NewReader(&sr)
+				}
+			} else {
+				fr = flate.NewReader(&sr)
+			}
+			if expectedSize > 0 {
+				if r != nil {
+					out = r.AllocBytes(expectedSize)
+				} else {
+					out = make([]byte, expectedSize)
+				}
+				if _, err = io.ReadFull(fr, out); err != nil {
+					_ = fr.Close()
+					flateReaderPool.Put(fr)
+					return nil, 0, err
+				}
+			}
+			var extra [1]byte
+			n, rerr := fr.Read(extra[:])
+			if n > 0 || (rerr != nil && rerr != io.EOF) {
+				_ = fr.Close()
+				flateReaderPool.Put(fr)
+				if rerr == nil {
+					return nil, 0, errors.New("inflated pack object larger than declared size")
+				}
+				return nil, 0, rerr
+			}
+			_ = fr.Close()
+			flateReaderPool.Put(fr)
+			if 2+sr.pos+4 > len(data) {
+				return nil, 0, errors.New("zlib trailer truncated")
+			}
+			wantAdler := binary.BigEndian.Uint32(data[2+sr.pos : 2+sr.pos+4])
+			if adler32.Checksum(out) != wantAdler {
+				return nil, 0, zlib.ErrChecksum
+			}
+			return out, 2 + sr.pos + 4, nil
+		}
+	}
+
 	sr := sliceReader{b: data}
 	var zr io.ReadCloser
 	if pooled := zlibReaderPool.Get(); pooled != nil {
@@ -262,12 +320,7 @@ func ParsePackAndStoreLocked(r *store.Repo, pack []byte) error {
 	trailerStart := len(pack) - 20
 
 	// Verify trailing SHA-1 checksum.
-	h := sha1Pool.Get().(hash.Hash)
-	h.Reset()
-	_, _ = h.Write(pack[:trailerStart])
-	var sum [20]byte
-	h.Sum(sum[:0])
-	sha1Pool.Put(h)
+	sum := sha1.Sum(pack[:trailerStart])
 	if !bytes.Equal(sum[:], pack[trailerStart:]) {
 		return errors.New("pack checksum mismatch")
 	}
@@ -536,12 +589,7 @@ func WritePackLevel(objects []*store.GitObject, level int) ([]byte, error) {
 	}
 	pool.Put(zw)
 
-	h := sha1Pool.Get().(hash.Hash)
-	h.Reset()
-	_, _ = h.Write(out)
-	var sum [20]byte
-	h.Sum(sum[:0])
-	sha1Pool.Put(h)
+	sum := sha1.Sum(out)
 	out = append(out, sum[:]...)
 	return out, nil
 }

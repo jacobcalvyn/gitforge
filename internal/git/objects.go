@@ -77,6 +77,16 @@ func FormatOID(oid [20]byte) string {
 
 // HashObject computes Git's canonical SHA-1 object ID.
 func HashObject(objType store.ObjType, data []byte) [20]byte {
+	if len(data) <= 2048 {
+		var buf [2112]byte
+		b := buf[:0]
+		b = append(b, objType.String()...)
+		b = append(b, ' ')
+		b = strconv.AppendInt(b, int64(len(data)), 10)
+		b = append(b, 0)
+		b = append(b, data...)
+		return sha1.Sum(b)
+	}
 	h := sha1Pool.Get().(hash.Hash)
 	h.Reset()
 	var hdr [48]byte

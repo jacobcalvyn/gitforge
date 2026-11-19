@@ -18,8 +18,8 @@ import (
 const (
 	maxHeaderBytes = 64 * 1024
 	maxBodyBytes   = 64 * 1024 * 1024
-	initReadBuf    = 64 * 1024
-	initWriteBuf   = 64 * 1024
+	initReadBuf    = 16 * 1024
+	initWriteBuf   = 8 * 1024
 	initBodyBuf    = 4096
 	idleTimeout    = 120 * time.Second
 )
@@ -431,15 +431,21 @@ func (c *connState) ensureReadCap(minCap int) {
 	c.readBuf = nb
 }
 
+var (
+	crlfcrlf = []byte("\r\n\r\n")
+	lflf     = []byte("\n\n")
+)
+
 func findHeaderEnd(buf []byte) (hdrEnd, sepLen int) {
-	n := len(buf)
-	for i := 0; i+1 < n; i++ {
-		if buf[i] == '\r' && i+3 < n && buf[i+1] == '\n' && buf[i+2] == '\r' && buf[i+3] == '\n' {
-			return i, 4
+	idx4 := bytes.Index(buf, crlfcrlf)
+	if idx4 >= 0 {
+		if idx2 := bytes.Index(buf[:idx4], lflf); idx2 >= 0 {
+			return idx2, 2
 		}
-		if buf[i] == '\n' && buf[i+1] == '\n' {
-			return i, 2
-		}
+		return idx4, 4
+	}
+	if idx2 := bytes.Index(buf, lflf); idx2 >= 0 {
+		return idx2, 2
 	}
 	return -1, 0
 }
@@ -542,47 +548,54 @@ func (s *Server) parseRequestHeaders(c *connState, hdrBytes []byte) bool {
 		nameBytes := trimASCIIWhitespace(line[:colon])
 		valBytes := trimASCIIWhitespace(line[colon+1:])
 
-		switch {
-		case bytesEqualFoldASCII(nameBytes, "Content-Length"):
-			cl, err := parsePositiveInt(valBytes)
-			if err != nil || cl < 0 || cl > maxBodyBytes {
-				_ = c.w.WriteJSON(400, []byte(`{"message":"Invalid Content-Length"}`+"\n"))
-				return false
+		switch len(nameBytes) {
+		case 4:
+			if bytesEqualFoldASCII(nameBytes, "Host") {
+				req.Host = b2s(valBytes)
 			}
-			c.contentLength = cl
-		case bytesEqualFoldASCII(nameBytes, "Transfer-Encoding"):
-			if containsFoldASCII(valBytes, "chunked") {
-				c.chunked = true
-			}
-		case bytesEqualFoldASCII(nameBytes, "Connection"):
-			if containsFoldASCII(valBytes, "close") {
-				req.Close = true
-			} else if containsFoldASCII(valBytes, "keep-alive") {
-				req.Close = false
-			}
-		case bytesEqualFoldASCII(nameBytes, "Host"):
-			req.Host = b2s(valBytes)
-		case bytesEqualFoldASCII(nameBytes, "Authorization"):
-			req.Auth = b2s(valBytes)
-		case bytesEqualFoldASCII(nameBytes, "Content-Type"):
-			req.ContentType = b2s(valBytes)
-		case bytesEqualFoldASCII(nameBytes, "Git-Protocol"):
-			req.GitProtocol = b2s(valBytes)
-		case bytesEqualFoldASCII(nameBytes, "Mcp-Session-Id"):
-			req.MCPSessionID = b2s(valBytes)
-		case bytesEqualFoldASCII(nameBytes, "Mcp-Protocol-Version"):
-			req.MCPProtocolVersion = b2s(valBytes)
-		case bytesEqualFoldASCII(nameBytes, "Expect"):
-			if bytesEqualFoldASCII(valBytes, "100-continue") {
+		case 6:
+			if bytesEqualFoldASCII(nameBytes, "Expect") && bytesEqualFoldASCII(valBytes, "100-continue") {
 				c.expectContinue = true
 			}
-		case bytesEqualFoldASCII(nameBytes, "Accept"),
-			bytesEqualFoldASCII(nameBytes, "User-Agent"),
-			bytesEqualFoldASCII(nameBytes, "Accept-Encoding"),
-			bytesEqualFoldASCII(nameBytes, "Accept-Language"):
-			// Ignored on hot path to avoid per-request allocations.
+		case 10:
+			if bytesEqualFoldASCII(nameBytes, "Connection") {
+				if containsFoldASCII(valBytes, "close") {
+					req.Close = true
+				} else if containsFoldASCII(valBytes, "keep-alive") {
+					req.Close = false
+				}
+			}
+		case 12:
+			if bytesEqualFoldASCII(nameBytes, "Content-Type") {
+				req.ContentType = b2s(valBytes)
+			} else if bytesEqualFoldASCII(nameBytes, "Git-Protocol") {
+				req.GitProtocol = b2s(valBytes)
+			}
+		case 13:
+			if bytesEqualFoldASCII(nameBytes, "Authorization") {
+				req.Auth = b2s(valBytes)
+			}
+		case 14:
+			if bytesEqualFoldASCII(nameBytes, "Content-Length") {
+				cl, err := parsePositiveInt(valBytes)
+				if err != nil || cl < 0 || cl > maxBodyBytes {
+					_ = c.w.WriteJSON(400, []byte(`{"message":"Invalid Content-Length"}`+"\n"))
+					return false
+				}
+				c.contentLength = cl
+			} else if bytesEqualFoldASCII(nameBytes, "Mcp-Session-Id") {
+				req.MCPSessionID = b2s(valBytes)
+			}
+		case 17:
+			if bytesEqualFoldASCII(nameBytes, "Transfer-Encoding") && containsFoldASCII(valBytes, "chunked") {
+				c.chunked = true
+			}
+		case 20:
+			if bytesEqualFoldASCII(nameBytes, "Mcp-Protocol-Version") {
+				req.MCPProtocolVersion = b2s(valBytes)
+			}
 		default:
-			req.Headers = append(req.Headers, Header{Name: b2s(nameBytes), Value: b2s(valBytes)})
+			// Unused headers are dropped without heap allocations.
 		}
 	}
 
