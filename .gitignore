@@ -1,0 +1,5 @@
+forge-local
+tmp/
+*.log
+*.tar.gz
+.DS_Store
