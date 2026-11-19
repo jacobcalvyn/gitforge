@@ -72,3 +72,50 @@ func TestTreeSortAndPackRoundTrip(t *testing.T) {
 		t.Fatalf("pack roundtrip failed")
 	}
 }
+
+func TestFastCommitAndSingleMainRecvAdv(t *testing.T) {
+	st := store.New()
+	r, _ := st.CreateRepo(store.ViewerLogin, "fast-test", "", true, "main")
+
+	var treeOID, parentOID [20]byte
+	for i := range treeOID {
+		treeOID[i] = byte(i + 1)
+		parentOID[i] = byte(0x80 + i)
+	}
+	rawCommit := BuildCommit(treeOID, [][20]byte{parentOID}, store.ViewerName, store.ViewerEmail, 1735689600, "feat: hello world")
+	commitOID := HashObject(store.ObjCommit, rawCommit)
+
+	r.GitMu.Lock()
+	r.Objects[commitOID] = r.AllocGitObject(store.ObjCommit, rawCommit)
+	ci := r.AllocCommitInfo()
+	if err := ParseCommitFastInto(rawCommit, ci); err != nil {
+		t.Fatal(err)
+	}
+	r.Commits[commitOID] = ci
+
+	msg := CommitMessageLocked(r, commitOID, ci)
+	if msg != "feat: hello world" {
+		t.Fatalf("expected commit message 'feat: hello world', got %q", msg)
+	}
+	if ci.Tree != treeOID || len(ci.Parents) != 1 || ci.Parents[0] != parentOID {
+		t.Fatalf("unexpected fast commit fields: tree=%x parents=%x", ci.Tree, ci.Parents)
+	}
+
+	r.UpdateSingleMainRecvAdvLocked(commitOID)
+	p1 := *r.CachedRecvInfoRefs.Load()
+	hexOID := FormatOID(commitOID)
+	if !bytes.Contains(p1, []byte(hexOID+" refs/heads/main\x00")) {
+		t.Fatalf("missing OID in ping-pong recv advertisement: %q", string(p1))
+	}
+
+	r.UpdateSingleMainRecvAdvLocked(treeOID)
+	p2 := *r.CachedRecvInfoRefs.Load()
+	if !bytes.Contains(p2, []byte(FormatOID(treeOID)+" refs/heads/main\x00")) {
+		t.Fatalf("missing updated OID in ping-pong recv advertisement: %q", string(p2))
+	}
+	// Ping-pong buffers must be distinct slices so concurrent readers never observe tearing.
+	if &p1[0] == &p2[0] {
+		t.Fatalf("ping-pong buffers reused the same slice address")
+	}
+	r.GitMu.Unlock()
+}

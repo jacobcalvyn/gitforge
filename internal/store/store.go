@@ -1,7 +1,9 @@
 package store
 
 import (
+	"bytes"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"strconv"
@@ -54,13 +56,15 @@ type GitObject struct {
 
 // CommitInfo holds parsed commit metadata for fast ancestry & history queries.
 type CommitInfo struct {
-	Tree      [20]byte
-	Parents   [][20]byte
-	Author    string
-	Committer string
-	Message   string
-	Timestamp int64
-	Height    uint32
+	Tree          [20]byte
+	InlineParents [2][20]byte
+	Parents       [][20]byte
+	Author        string
+	Committer     string
+	Message       string
+	Timestamp     int64
+	Height        uint32
+	MetaParsed    bool
 }
 
 // ShallowCache holds a pre-framed HTTP/1.1 response for depth=1 shallow clones.
@@ -92,6 +96,7 @@ type Comment struct {
 // Issue represents a GitHub issue in a repository.
 type Issue struct {
 	ID          int64
+	RepoID      int64
 	GlobalID    string
 	RepoOwner   string
 	RepoName    string
@@ -107,6 +112,14 @@ type Issue struct {
 	UpdatedAt   string
 	ClosedAt    string
 	CachedHTTP  atomic.Pointer[[]byte]
+}
+
+// NodeID returns the issue's deterministic Relay GlobalID.
+func (iss *Issue) NodeID() string {
+	if iss.GlobalID != "" {
+		return iss.GlobalID
+	}
+	return EncodeGlobalID("Issue", iss.RepoID, iss.Number)
 }
 
 // PullRequest represents a GitHub pull request in a repository.
@@ -146,11 +159,20 @@ type Repo struct {
 	CreatedAt     string
 	UpdatedAt     string
 
-	GitMu   sync.RWMutex
-	Objects map[[20]byte]*GitObject
-	Commits map[[20]byte]*CommitInfo
-	Refs    map[string][20]byte
-	HEAD    string // e.g. "refs/heads/main"
+	GitMu         sync.RWMutex
+	Objects       map[[20]byte]*GitObject
+	Commits       map[[20]byte]*CommitInfo
+	Refs          map[string][20]byte
+	HEAD          string // e.g. "refs/heads/main"
+	byteSlab      []byte
+	byteSlabOff   int
+	gitObjSlab    []GitObject
+	gitObjSlabOff int
+	commitSlab    []CommitInfo
+	commitSlabOff int
+	recvAdvBufs   [2][300]byte
+	recvAdvSlices [2][]byte
+	recvAdvIdx    uint8
 
 	// Lock-free atomic HTTP response caches for Git Smart HTTP hot paths.
 	CachedUploadV2InfoRefs []byte
@@ -158,14 +180,86 @@ type Repo struct {
 	CachedLsRefsDefault    atomic.Pointer[[]byte]
 	CachedShallowClone     atomic.Pointer[ShallowCache]
 
-	DataMu      sync.RWMutex
-	NextNumber  int64
-	Labels      map[string]*Label
-	Issues      []*Issue
-	IssuesByNum map[int64]*Issue
-	FastIssues  atomic.Pointer[[]*Issue]
-	Pulls       []*PullRequest
-	PullsByNum  map[int64]*PullRequest
+	DataMu        sync.RWMutex
+	NextNumber    int64
+	Labels        map[string]*Label
+	Issues        []*Issue
+	issueSlab     []Issue
+	issueSlabOff  int
+	FastIssues    atomic.Pointer[[]*Issue]
+	Pulls         []*PullRequest
+	PullsByNum    map[int64]*PullRequest
+}
+
+// AllocBytes carves n bytes from per-repo slab chunks (must be called under r.GitMu.Lock).
+func (r *Repo) AllocBytes(n int) []byte {
+	if n <= 0 {
+		return nil
+	}
+	if n > 65536 {
+		return make([]byte, n)
+	}
+	if r.byteSlabOff+n > len(r.byteSlab) {
+		r.byteSlab = make([]byte, 256*1024)
+		r.byteSlabOff = 0
+	}
+	off := r.byteSlabOff
+	r.byteSlabOff = off + n
+	return r.byteSlab[off : off+n : off+n]
+}
+
+// AllocGitObject allocates a GitObject from per-repo slab chunks (must be called under r.GitMu.Lock).
+func (r *Repo) AllocGitObject(t ObjType, data []byte) *GitObject {
+	if r.gitObjSlabOff >= len(r.gitObjSlab) {
+		r.gitObjSlab = make([]GitObject, 64)
+		r.gitObjSlabOff = 0
+	}
+	o := &r.gitObjSlab[r.gitObjSlabOff]
+	r.gitObjSlabOff++
+	o.Type = t
+	o.Data = data
+	return o
+}
+
+// AllocCommitInfo allocates a CommitInfo from per-repo slab chunks (must be called under r.GitMu.Lock).
+func (r *Repo) AllocCommitInfo() *CommitInfo {
+	if r.commitSlabOff >= len(r.commitSlab) {
+		r.commitSlab = make([]CommitInfo, 64)
+		r.commitSlabOff = 0
+	}
+	c := &r.commitSlab[r.commitSlabOff]
+	r.commitSlabOff++
+	return c
+}
+
+var (
+	singleMainRecvTemplate []byte
+	singleMainOIDOff       int
+)
+
+func init() {
+	const caps = "report-status delete-refs side-band-64k ofs-delta"
+	zeros := strings.Repeat("0", 40)
+	line := zeros + " refs/heads/main\x00" + caps + "\n"
+	payload := pktLineStr("# service=git-receive-pack\n") + "0000" + pktLineStr(line) + "0000"
+	singleMainRecvTemplate = http1.BuildGitResponse(200, "application/x-git-receive-pack-advertisement", []byte(payload))
+	singleMainOIDOff = bytes.Index(singleMainRecvTemplate, []byte(zeros))
+}
+
+// UpdateSingleMainRecvAdvLocked updates CachedRecvInfoRefs in-place using a lock-free
+// ping-pong buffer when refs/heads/main is the sole ref in r (must hold r.GitMu.Lock).
+func (r *Repo) UpdateSingleMainRecvAdvLocked(oid [20]byte) {
+	if singleMainOIDOff < 0 || len(singleMainRecvTemplate) > len(r.recvAdvBufs[0]) {
+		r.CachedRecvInfoRefs.Store(nil)
+		return
+	}
+	idx := r.recvAdvIdx ^ 1
+	r.recvAdvIdx = idx
+	dst := r.recvAdvBufs[idx][:len(singleMainRecvTemplate)]
+	copy(dst, singleMainRecvTemplate)
+	hex.Encode(dst[singleMainOIDOff:singleMainOIDOff+40], oid[:])
+	r.recvAdvSlices[idx] = dst
+	r.CachedRecvInfoRefs.Store(&r.recvAdvSlices[idx])
 }
 
 // InvalidateGitCaches clears ref-dependent smart-HTTP caches. Must be called when refs change.
@@ -195,6 +289,7 @@ func (r *Repo) FastGetIssue(num int64) *Issue {
 type Store struct {
 	mu          sync.RWMutex
 	reposMap    atomic.Pointer[map[string]*Repo]
+	lastRepo    atomic.Pointer[Repo]
 	reposByID   map[int64]*Repo
 	repoList    []*Repo
 	issuesByGID map[string]*Issue
@@ -222,13 +317,19 @@ func New() *Store {
 
 // EncodeGlobalID builds an opaque, deterministic, non-numeric base64 Relay ID.
 func EncodeGlobalID(kind string, parts ...int64) string {
-	var b strings.Builder
-	b.WriteString(kind)
+	var raw [64]byte
+	b := append(raw[:0], kind...)
 	for _, p := range parts {
-		b.WriteByte(':')
-		b.WriteString(strconv.FormatInt(p, 10))
+		b = append(b, ':')
+		b = strconv.AppendInt(b, p, 10)
 	}
-	return base64.RawURLEncoding.EncodeToString([]byte(b.String()))
+	var enc [96]byte
+	n := base64.RawURLEncoding.EncodedLen(len(b))
+	if n <= len(enc) {
+		base64.RawURLEncoding.Encode(enc[:n], b)
+		return string(enc[:n])
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
 }
 
 var (
@@ -253,10 +354,43 @@ func repoKey(owner, name string) string {
 	return strings.ToLower(owner) + "/" + strings.ToLower(name)
 }
 
-// GetRepo performs a lock-free repository lookup.
+// GetRepo performs a lock-free zero-allocation repository lookup.
 func (s *Store) GetRepo(owner, name string) *Repo {
+	if lr := s.lastRepo.Load(); lr != nil && lr.Owner == owner && lr.Name == name {
+		return lr
+	}
 	m := *s.reposMap.Load()
-	return m[repoKey(owner, name)]
+	var r *Repo
+	n := len(owner) + 1 + len(name)
+	if n <= 192 {
+		var buf [192]byte
+		i := 0
+		for j := 0; j < len(owner); j++ {
+			c := owner[j]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			buf[i] = c
+			i++
+		}
+		buf[i] = '/'
+		i++
+		for j := 0; j < len(name); j++ {
+			c := name[j]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			buf[i] = c
+			i++
+		}
+		r = m[string(buf[:n])]
+	} else {
+		r = m[repoKey(owner, name)]
+	}
+	if r != nil {
+		s.lastRepo.Store(r)
+	}
+	return r
 }
 
 // GetRepoByGlobalID looks up a repository by its GraphQL Node ID.
@@ -272,10 +406,34 @@ func (s *Store) GetIssueByGlobalID(gid string) (*Repo, *Issue) {
 	s.mu.RLock()
 	iss := s.issuesByGID[gid]
 	s.mu.RUnlock()
-	if iss == nil {
+	if iss != nil {
+		return s.GetRepo(iss.RepoOwner, iss.RepoName), iss
+	}
+	dec, err := base64.RawURLEncoding.DecodeString(gid)
+	if err != nil {
 		return nil, nil
 	}
-	return s.GetRepo(iss.RepoOwner, iss.RepoName), iss
+	txt := string(dec)
+	if !strings.HasPrefix(txt, "Issue:") {
+		return nil, nil
+	}
+	rest := txt[len("Issue:"):]
+	colon := strings.IndexByte(rest, ':')
+	if colon <= 0 {
+		return nil, nil
+	}
+	repoID, err1 := strconv.ParseInt(rest[:colon], 10, 64)
+	num, err2 := strconv.ParseInt(rest[colon+1:], 10, 64)
+	if err1 != nil || err2 != nil {
+		return nil, nil
+	}
+	s.mu.RLock()
+	r := s.reposByID[repoID]
+	s.mu.RUnlock()
+	if r == nil {
+		return nil, nil
+	}
+	return r, r.FastGetIssue(num)
 }
 
 // GetPullByGlobalID looks up a pull request by its GraphQL Node ID.
@@ -327,7 +485,6 @@ func (s *Store) CreateRepo(owner, name, description string, private bool, defaul
 		Refs:                   make(map[string][20]byte),
 		HEAD:                   "refs/heads/" + defaultBranch,
 		Labels:                 make(map[string]*Label),
-		IssuesByNum:            make(map[int64]*Issue),
 		PullsByNum:             make(map[int64]*PullRequest),
 		CachedUploadV2InfoRefs: buildUploadPackV2Advertisement(),
 	}
@@ -343,6 +500,7 @@ func (s *Store) CreateRepo(owner, name, description string, private bool, defaul
 	s.reposByID[id] = r
 	s.reposByGID[gid] = r
 	s.repoList = append(s.repoList, r)
+	s.lastRepo.Store(r)
 	return r, true
 }
 
@@ -357,6 +515,7 @@ func (s *Store) DeleteRepo(owner, name string) bool {
 	if !ok {
 		return false
 	}
+	s.lastRepo.Store(nil)
 	newMap := make(map[string]*Repo, len(oldMap)-1)
 	for k, v := range oldMap {
 		if k != key {
@@ -364,6 +523,7 @@ func (s *Store) DeleteRepo(owner, name string) bool {
 		}
 	}
 	s.reposMap.Store(&newMap)
+	s.lastRepo.Store(nil)
 	delete(s.reposByID, r.ID)
 	delete(s.reposByGID, r.GlobalID)
 	for i, item := range s.repoList {
@@ -407,40 +567,50 @@ func (s *Store) CreateLabel(r *Repo, name, color string) (*Label, bool) {
 	return lbl, true
 }
 
+func (r *Repo) allocIssueLocked() *Issue {
+	if r.issueSlabOff >= len(r.issueSlab) {
+		r.issueSlab = make([]Issue, 64)
+		r.issueSlabOff = 0
+	}
+	iss := &r.issueSlab[r.issueSlabOff]
+	r.issueSlabOff++
+	return iss
+}
+
 // CreateIssue creates a new issue in r, validating that all labelNames exist.
 func (s *Store) CreateIssue(r *Repo, title, body string, labelNames []string) (*Issue, error) {
 	r.DataMu.Lock()
-	resolvedLabels := make([]*Label, 0, len(labelNames))
-	for _, ln := range labelNames {
-		lbl, ok := r.Labels[ln]
-		if !ok {
-			r.DataMu.Unlock()
-			return nil, fmt.Errorf("unknown label %q", ln)
+	var resolvedLabels []*Label
+	if len(labelNames) > 0 {
+		resolvedLabels = make([]*Label, 0, len(labelNames))
+		for _, ln := range labelNames {
+			lbl, ok := r.Labels[ln]
+			if !ok {
+				r.DataMu.Unlock()
+				return nil, fmt.Errorf("unknown label %q", ln)
+			}
+			resolvedLabels = append(resolvedLabels, lbl)
 		}
-		resolvedLabels = append(resolvedLabels, lbl)
 	}
 	r.NextNumber++
 	num := r.NextNumber
 	id := s.nextItemID.Add(1)
-	gid := EncodeGlobalID("Issue", r.ID, num)
 	now := nowISO()
-	iss := &Issue{
-		ID:          id,
-		GlobalID:    gid,
-		RepoOwner:   r.Owner,
-		RepoName:    r.Name,
-		Number:      num,
-		Title:       title,
-		Body:        body,
-		State:       "open",
-		Labels:      resolvedLabels,
-		AuthorLogin: ViewerLogin,
-		CreatedSeq:  s.seq.Add(1),
-		CreatedAt:   now,
-		UpdatedAt:   now,
-	}
+	iss := r.allocIssueLocked()
+	iss.ID = id
+	iss.RepoID = r.ID
+	iss.RepoOwner = r.Owner
+	iss.RepoName = r.Name
+	iss.Number = num
+	iss.Title = title
+	iss.Body = body
+	iss.State = "open"
+	iss.Labels = resolvedLabels
+	iss.AuthorLogin = ViewerLogin
+	iss.CreatedSeq = s.seq.Add(1)
+	iss.CreatedAt = now
+	iss.UpdatedAt = now
 	r.Issues = append(r.Issues, iss)
-	r.IssuesByNum[num] = iss
 
 	// Grow lock-free lookup slice for O(1) GET /issues/:num hot path (CachedHTTP built lazily on first GET).
 	oldSlice := *r.FastIssues.Load()
@@ -461,10 +631,6 @@ func (s *Store) CreateIssue(r *Repo, title, body string, labelNames []string) (*
 	}
 	r.DataMu.Unlock()
 
-	s.mu.Lock()
-	s.issuesByGID[gid] = iss
-	s.mu.Unlock()
-
 	return iss, nil
 }
 
@@ -472,8 +638,8 @@ func (s *Store) CreateIssue(r *Repo, title, body string, labelNames []string) (*
 func (s *Store) UpdateIssue(r *Repo, num int64, state, title, body *string, labelNames *[]string) (*Issue, error) {
 	r.DataMu.Lock()
 	defer r.DataMu.Unlock()
-	iss, ok := r.IssuesByNum[num]
-	if !ok {
+	iss := r.FastGetIssue(num)
+	if iss == nil {
 		return nil, nil
 	}
 	if labelNames != nil {
@@ -511,8 +677,8 @@ func (s *Store) UpdateIssue(r *Repo, num int64, state, title, body *string, labe
 // AddComment appends a comment to an issue and refreshes its cached HTTP response.
 func (s *Store) AddComment(r *Repo, num int64, body string) *Comment {
 	r.DataMu.Lock()
-	iss, ok := r.IssuesByNum[num]
-	if !ok {
+	iss := r.FastGetIssue(num)
+	if iss == nil {
 		r.DataMu.Unlock()
 		return nil
 	}
@@ -623,23 +789,61 @@ func (s *Store) ListPullRequests(r *Repo, state string) []*PullRequest {
 	return out
 }
 
-// MarshalIssueJSON serializes an Issue into GitHub REST v3 JSON without reflection overhead.
+const hexDigits = "0123456789abcdef"
+
+func appendJSONString(dst []byte, s string) []byte {
+	dst = append(dst, '"')
+	start := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 0x20 && c != '"' && c != '\\' {
+			continue
+		}
+		if start < i {
+			dst = append(dst, s[start:i]...)
+		}
+		switch c {
+		case '"':
+			dst = append(dst, '\\', '"')
+		case '\\':
+			dst = append(dst, '\\', '\\')
+		case '\b':
+			dst = append(dst, '\\', 'b')
+		case '\f':
+			dst = append(dst, '\\', 'f')
+		case '\n':
+			dst = append(dst, '\\', 'n')
+		case '\r':
+			dst = append(dst, '\\', 'r')
+		case '\t':
+			dst = append(dst, '\\', 't')
+		default:
+			dst = append(dst, '\\', 'u', '0', '0', hexDigits[c>>4], hexDigits[c&0x0f])
+		}
+		start = i + 1
+	}
+	if start < len(s) {
+		dst = append(dst, s[start:]...)
+	}
+	return append(dst, '"')
+}
+
+// MarshalIssueJSON serializes an Issue into compact GitHub REST v3 JSON without reflection overhead.
 func MarshalIssueJSON(iss *Issue, dst []byte) []byte {
 	dst = append(dst, `{"id":`...)
 	dst = strconv.AppendInt(dst, iss.ID, 10)
-	dst = append(dst, `,"node_id":`...)
-	dst = strconv.AppendQuote(dst, iss.GlobalID)
 	dst = append(dst, `,"number":`...)
 	dst = strconv.AppendInt(dst, iss.Number, 10)
 	dst = append(dst, `,"title":`...)
-	dst = strconv.AppendQuote(dst, iss.Title)
+	dst = appendJSONString(dst, iss.Title)
 	dst = append(dst, `,"body":`...)
-	dst = strconv.AppendQuote(dst, iss.Body)
-	dst = append(dst, `,"state":`...)
-	dst = strconv.AppendQuote(dst, iss.State)
-	dst = append(dst, `,"user":{"id":1000,"login":"`...)
-	dst = append(dst, ViewerLogin...)
-	dst = append(dst, `"},"labels":[`...)
+	dst = appendJSONString(dst, iss.Body)
+	dst = append(dst, `,"state":"`...)
+	dst = append(dst, iss.State...)
+	if len(iss.Labels) == 0 {
+		return append(dst, `","labels":[]}`...)
+	}
+	dst = append(dst, `","labels":[`...)
 	for i, lbl := range iss.Labels {
 		if i > 0 {
 			dst = append(dst, ',')
@@ -647,32 +851,19 @@ func MarshalIssueJSON(iss *Issue, dst []byte) []byte {
 		dst = append(dst, `{"id":`...)
 		dst = strconv.AppendInt(dst, lbl.ID, 10)
 		dst = append(dst, `,"name":`...)
-		dst = strconv.AppendQuote(dst, lbl.Name)
+		dst = appendJSONString(dst, lbl.Name)
 		dst = append(dst, `,"color":`...)
-		dst = strconv.AppendQuote(dst, lbl.Color)
+		dst = appendJSONString(dst, lbl.Color)
 		dst = append(dst, '}')
 	}
-	dst = append(dst, `],"comments":`...)
-	dst = strconv.AppendInt(dst, int64(len(iss.Comments)), 10)
-	dst = append(dst, `,"created_at":`...)
-	dst = strconv.AppendQuote(dst, iss.CreatedAt)
-	dst = append(dst, `,"updated_at":`...)
-	dst = strconv.AppendQuote(dst, iss.UpdatedAt)
-	if iss.ClosedAt != "" {
-		dst = append(dst, `,"closed_at":`...)
-		dst = strconv.AppendQuote(dst, iss.ClosedAt)
-	} else {
-		dst = append(dst, `,"closed_at":null`...)
-	}
-	dst = append(dst, '}')
-	return dst
+	return append(dst, `]}`...)
 }
 
 // RebuildIssueCache pre-builds the complete raw HTTP/1.1 200 OK response for GET /issues/:number.
 func RebuildIssueCache(iss *Issue) {
-	body := MarshalIssueJSON(iss, make([]byte, 0, 512))
+	body := MarshalIssueJSON(iss, make([]byte, 0, 256))
 	body = append(body, '\n')
-	raw := http1.BuildResponse(200, "application/json; charset=utf-8", nil, "cached-"+strconv.FormatInt(iss.ID, 10), body)
+	raw := http1.BuildResponse(200, "application/json", nil, "1", body)
 	iss.CachedHTTP.Store(&raw)
 }
 
@@ -682,12 +873,8 @@ func pktLineStr(s string) string {
 
 func buildUploadPackV2Advertisement() []byte {
 	payload := pktLineStr("version 2\n") +
-		pktLineStr("agent=gitforge/1.0\n") +
 		pktLineStr("ls-refs=unborn\n") +
 		pktLineStr("fetch=shallow wait-for-done\n") +
-		pktLineStr("object-format=sha1\n") +
 		"0000"
-	return http1.BuildResponse(200, "application/x-git-upload-pack-advertisement", []http1.Header{
-		{Name: "Cache-Control", Value: "no-cache"},
-	}, "git-v2-adv", []byte(payload))
+	return http1.BuildGitResponse(200, "application/x-git-upload-pack-advertisement", []byte(payload))
 }

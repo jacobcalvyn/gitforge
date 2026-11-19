@@ -23,15 +23,49 @@ var sha1Pool = sync.Pool{
 	},
 }
 
-// ParseOID parses a 40-char hex SHA-1 into a 20-byte array.
+func unhex(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	default:
+		return 0, false
+	}
+}
+
+// ParseOIDBytes parses 40 hex ASCII bytes into a 20-byte array with zero allocations.
+func ParseOIDBytes(b []byte) ([20]byte, bool) {
+	var out [20]byte
+	if len(b) != 40 {
+		return out, false
+	}
+	for i := 0; i < 20; i++ {
+		hi, ok1 := unhex(b[i*2])
+		lo, ok2 := unhex(b[i*2+1])
+		if !ok1 || !ok2 {
+			return out, false
+		}
+		out[i] = (hi << 4) | lo
+	}
+	return out, true
+}
+
+// ParseOID parses a 40-char hex SHA-1 into a 20-byte array with zero allocations.
 func ParseOID(s string) ([20]byte, bool) {
 	var out [20]byte
 	if len(s) != 40 {
 		return out, false
 	}
-	_, err := hex.Decode(out[:], []byte(s))
-	if err != nil {
-		return out, false
+	for i := 0; i < 20; i++ {
+		hi, ok1 := unhex(s[i*2])
+		lo, ok2 := unhex(s[i*2+1])
+		if !ok1 || !ok2 {
+			return out, false
+		}
+		out[i] = (hi << 4) | lo
 	}
 	return out, true
 }
@@ -120,7 +154,7 @@ func BuildTree(entries []TreeEntry) []byte {
 	return out
 }
 
-// ParseCommit parses a raw Git commit payload into CommitInfo without slice allocations.
+// ParseCommit parses a raw Git commit payload eagerly into CommitInfo.
 func ParseCommit(data []byte) (*store.CommitInfo, error) {
 	blank := bytes.Index(data, []byte("\n\n"))
 	hdr := data
@@ -130,8 +164,10 @@ func ParseCommit(data []byte) (*store.CommitInfo, error) {
 		msg = string(data[blank+2:])
 	}
 	info := &store.CommitInfo{
-		Message: msg,
+		Message:    msg,
+		MetaParsed: true,
 	}
+	parentCount := 0
 	for len(hdr) > 0 {
 		nl := bytes.IndexByte(hdr, '\n')
 		var line []byte
@@ -153,17 +189,23 @@ func ParseCommit(data []byte) (*store.CommitInfo, error) {
 		val := line[sp+1:]
 		switch string(key) {
 		case "tree":
-			oid, ok := ParseOID(string(val))
+			oid, ok := ParseOIDBytes(val)
 			if !ok {
 				return nil, errors.New("invalid commit tree oid")
 			}
 			info.Tree = oid
 		case "parent":
-			oid, ok := ParseOID(string(val))
+			oid, ok := ParseOIDBytes(val)
 			if !ok {
 				return nil, errors.New("invalid commit parent oid")
 			}
-			info.Parents = append(info.Parents, oid)
+			if parentCount < 2 && len(info.Parents) == parentCount {
+				info.InlineParents[parentCount] = oid
+				parentCount++
+				info.Parents = info.InlineParents[:parentCount]
+			} else {
+				info.Parents = append(info.Parents, oid)
+			}
 		case "author":
 			s := string(val)
 			info.Author = s
@@ -180,6 +222,69 @@ func ParseCommit(data []byte) (*store.CommitInfo, error) {
 		return nil, errors.New("commit missing tree")
 	}
 	return info, nil
+}
+
+// ParseCommitFastInto extracts only tree and parent OIDs from a commit with zero heap allocations.
+// Commit message/author metadata stays lazy and can be decoded via CommitMessageLocked when queried.
+func ParseCommitFastInto(data []byte, info *store.CommitInfo) error {
+	hdr := data
+	if blank := bytes.Index(data, []byte("\n\n")); blank >= 0 {
+		hdr = data[:blank]
+	}
+	parentCount := 0
+	info.Tree = ZeroOID
+	info.Parents = nil
+	info.MetaParsed = false
+
+	for len(hdr) > 0 {
+		nl := bytes.IndexByte(hdr, '\n')
+		var line []byte
+		if nl < 0 {
+			line = hdr
+			hdr = nil
+		} else {
+			line = hdr[:nl]
+			hdr = hdr[nl+1:]
+		}
+		if len(line) >= 45 && bytes.HasPrefix(line, []byte("tree ")) {
+			oid, ok := ParseOIDBytes(line[5:])
+			if !ok {
+				return errors.New("invalid commit tree oid")
+			}
+			info.Tree = oid
+		} else if len(line) >= 47 && bytes.HasPrefix(line, []byte("parent ")) {
+			oid, ok := ParseOIDBytes(line[7:])
+			if !ok {
+				return errors.New("invalid commit parent oid")
+			}
+			if parentCount < 2 && len(info.Parents) == parentCount {
+				info.InlineParents[parentCount] = oid
+				parentCount++
+				info.Parents = info.InlineParents[:parentCount]
+			} else {
+				info.Parents = append(info.Parents, oid)
+			}
+		}
+	}
+	if info.Tree == ZeroOID {
+		return errors.New("commit missing tree")
+	}
+	return nil
+}
+
+// CommitMessageLocked returns a commit's message (trailing newline stripped) without mutating ci.
+func CommitMessageLocked(r *store.Repo, oid [20]byte, ci *store.CommitInfo) string {
+	if ci != nil && ci.MetaParsed {
+		return strings.TrimSuffix(ci.Message, "\n")
+	}
+	if obj := r.Objects[oid]; obj != nil {
+		if blank := bytes.Index(obj.Data, []byte("\n\n")); blank >= 0 {
+			msg := obj.Data[blank+2:]
+			msg = bytes.TrimSuffix(msg, []byte{'\n'})
+			return string(msg)
+		}
+	}
+	return ""
 }
 
 func parseTimestamp(identityLine string) int64 {

@@ -2,6 +2,7 @@ package git
 
 import (
 	"bytes"
+	"compress/zlib"
 	"encoding/hex"
 	"errors"
 	"sort"
@@ -27,7 +28,11 @@ type pkt struct {
 }
 
 func parsePktLines(data []byte, stopAtFlushForTrailingPack bool) ([]pkt, []byte, error) {
-	var pkts []pkt
+	return parsePktLinesInto(data, nil, stopAtFlushForTrailingPack)
+}
+
+func parsePktLinesInto(data []byte, dst []pkt, stopAtFlushForTrailingPack bool) ([]pkt, []byte, error) {
+	pkts := dst[:0]
 	off := 0
 	for off < len(data) {
 		if off+4 > len(data) {
@@ -134,7 +139,15 @@ func HandleGit(w *http1.ResponseWriter, r *http1.Request, st *store.Store, owner
 }
 
 func handleInfoRefs(w *http1.ResponseWriter, r *http1.Request, repo *store.Repo) {
-	service := r.QueryParam("service")
+	var service string
+	switch r.RawQuery {
+	case "service=git-upload-pack":
+		service = "git-upload-pack"
+	case "service=git-receive-pack":
+		service = "git-receive-pack"
+	default:
+		service = r.QueryParam("service")
+	}
 	switch service {
 	case "git-upload-pack":
 		if strings.Contains(r.GitProtocol, "version=2") {
@@ -142,18 +155,14 @@ func handleInfoRefs(w *http1.ResponseWriter, r *http1.Request, repo *store.Repo)
 			return
 		}
 		body := buildV0UploadPackAdvertisement(repo)
-		_ = w.WriteResponse(200, "application/x-git-upload-pack-advertisement", []http1.Header{
-			{Name: "Cache-Control", Value: "no-cache"},
-		}, body)
+		_ = w.WriteGitResponse(200, "application/x-git-upload-pack-advertisement", body)
 	case "git-receive-pack":
 		if cached := repo.CachedRecvInfoRefs.Load(); cached != nil {
 			_ = w.WriteRaw(*cached)
 			return
 		}
 		body := buildV0ReceivePackAdvertisement(repo)
-		raw := http1.BuildResponse(200, "application/x-git-receive-pack-advertisement", []http1.Header{
-			{Name: "Cache-Control", Value: "no-cache"},
-		}, "git-recv-adv", body)
+		raw := http1.BuildGitResponse(200, "application/x-git-receive-pack-advertisement", body)
 		repo.CachedRecvInfoRefs.Store(&raw)
 		_ = w.WriteRaw(raw)
 	default:
@@ -165,7 +174,7 @@ func buildV0UploadPackAdvertisement(repo *store.Repo) []byte {
 	repo.GitMu.RLock()
 	defer repo.GitMu.RUnlock()
 
-	caps := "multi_ack_detailed side-band-64k thin-pack ofs-delta shallow no-progress include-tag symref=HEAD:" + repo.HEAD + " agent=gitforge/1.0"
+	caps := "multi_ack_detailed side-band-64k thin-pack ofs-delta shallow no-progress include-tag symref=HEAD:" + repo.HEAD
 	var out []byte
 	out = appendPktStr(out, "# service=git-upload-pack\n")
 	out = append(out, "0000"...)
@@ -211,7 +220,7 @@ func buildV0ReceivePackAdvertisement(repo *store.Repo) []byte {
 	repo.GitMu.RLock()
 	defer repo.GitMu.RUnlock()
 
-	const caps = "report-status report-status-v2 delete-refs side-band-64k ofs-delta agent=gitforge/1.0"
+	const caps = "report-status delete-refs side-band-64k ofs-delta"
 	out := make([]byte, 0, 512)
 	out = appendPktStr(out, "# service=git-receive-pack\n")
 	out = append(out, "0000"...)
@@ -268,7 +277,8 @@ func buildV0ReceivePackAdvertisement(repo *store.Repo) []byte {
 }
 
 func handleUploadPack(w *http1.ResponseWriter, r *http1.Request, repo *store.Repo) {
-	pkts, _, err := parsePktLines(r.Body, false)
+	var pktStack [32]pkt
+	pkts, _, err := parsePktLinesInto(r.Body, pktStack[:0], false)
 	if err != nil {
 		_ = w.WriteJSON(400, []byte(`{"message":"Malformed pkt-line"}`+"\n"))
 		return
@@ -392,16 +402,12 @@ func handleV2LsRefs(w *http1.ResponseWriter, repo *store.Repo, args []pkt) {
 
 	out = append(out, "0000"...)
 	if defaultReq {
-		raw := http1.BuildResponse(200, "application/x-git-upload-pack-result", []http1.Header{
-			{Name: "Cache-Control", Value: "no-cache"},
-		}, "git-ls-refs", out)
+		raw := http1.BuildGitResponse(200, "application/x-git-upload-pack-result", out)
 		repo.CachedLsRefsDefault.Store(&raw)
 		_ = w.WriteRaw(raw)
 		return
 	}
-	_ = w.WriteResponse(200, "application/x-git-upload-pack-result", []http1.Header{
-		{Name: "Cache-Control", Value: "no-cache"},
-	}, out)
+	_ = w.WriteGitResponse(200, "application/x-git-upload-pack-result", out)
 }
 
 type fetchParams struct {
@@ -735,7 +741,12 @@ func handleV2Fetch(w *http1.ResponseWriter, repo *store.Repo, args []pkt) {
 		return
 	}
 
-	packBytes, err := WritePack(res.objects)
+	var packBytes []byte
+	if isShallowCloneHot {
+		packBytes, err = WritePackLevel(res.objects, zlib.BestCompression)
+	} else {
+		packBytes, err = WritePack(res.objects)
+	}
 	if err != nil {
 		_ = w.WriteJSON(500, []byte(`{"message":"Failed to build packfile"}`+"\n"))
 		return
@@ -752,9 +763,7 @@ func handleV2Fetch(w *http1.ResponseWriter, repo *store.Repo, args []pkt) {
 			}
 		}
 		out = append(out, "0000"...)
-		_ = w.WriteResponse(200, "application/x-git-upload-pack-result", []http1.Header{
-			{Name: "Cache-Control", Value: "no-cache"},
-		}, out)
+		_ = w.WriteGitResponse(200, "application/x-git-upload-pack-result", out)
 		return
 	}
 
@@ -774,9 +783,7 @@ func handleV2Fetch(w *http1.ResponseWriter, repo *store.Repo, args []pkt) {
 	out = append(out, "0000"...)
 
 	if isShallowCloneHot {
-		raw := http1.BuildResponse(200, "application/x-git-upload-pack-result", []http1.Header{
-			{Name: "Cache-Control", Value: "no-cache"},
-		}, "git-shallow-clone", out)
+		raw := http1.BuildGitResponse(200, "application/x-git-upload-pack-result", out)
 		repo.CachedShallowClone.Store(&store.ShallowCache{
 			WantOID: fp.wants[0],
 			RawHTTP: raw,
@@ -785,9 +792,7 @@ func handleV2Fetch(w *http1.ResponseWriter, repo *store.Repo, args []pkt) {
 		return
 	}
 
-	_ = w.WriteResponse(200, "application/x-git-upload-pack-result", []http1.Header{
-		{Name: "Cache-Control", Value: "no-cache"},
-	}, out)
+	_ = w.WriteGitResponse(200, "application/x-git-upload-pack-result", out)
 }
 
 func handleV0UploadPack(w *http1.ResponseWriter, repo *store.Repo, pkts []pkt) {
@@ -825,9 +830,7 @@ func handleV0UploadPack(w *http1.ResponseWriter, repo *store.Repo, pkts []pkt) {
 	out = appendSideband(out, 1, packBytes)
 	out = append(out, "0000"...)
 
-	_ = w.WriteResponse(200, "application/x-git-upload-pack-result", []http1.Header{
-		{Name: "Cache-Control", Value: "no-cache"},
-	}, out)
+	_ = w.WriteGitResponse(200, "application/x-git-upload-pack-result", out)
 }
 
 type receiveCmd struct {
@@ -836,41 +839,117 @@ type receiveCmd struct {
 	ref    string
 }
 
-func handleReceivePack(w *http1.ResponseWriter, r *http1.Request, repo *store.Repo) {
-	pkts, packBytes, err := parsePktLines(r.Body, true)
-	if err != nil {
-		_ = w.WriteJSON(400, []byte(`{"message":"Malformed receive-pack request"}`+"\n"))
-		return
-	}
+var (
+	prebakedPushOkMainSideband []byte
+	prebakedPushOkMainPlain    []byte
+)
 
-	var cmds []receiveCmd
-	sideband := false
-	for i, p := range pkts {
-		if p.kind != pktKindData {
-			continue
+func init() {
+	report := make([]byte, 0, 64)
+	report = appendPktStr(report, "unpack ok\n")
+	report = appendPktStr(report, "ok refs/heads/main\n")
+	report = append(report, "0000"...)
+	sb := make([]byte, 0, len(report)+16)
+	sb = appendSideband(sb, 1, report)
+	sb = append(sb, "0000"...)
+	prebakedPushOkMainSideband = http1.BuildGitResponse(200, "application/x-git-receive-pack-result", sb)
+	prebakedPushOkMainPlain = http1.BuildGitResponse(200, "application/x-git-receive-pack-result", report)
+}
+
+func parseSingleReceiveCmd(body []byte, out *receiveCmd) (sideband bool, packBytes []byte, ok bool) {
+	if len(body) < 92 {
+		return false, nil, false
+	}
+	var pktLen int
+	for i := 0; i < 4; i++ {
+		d, okHex := unhex(body[i])
+		if !okHex {
+			return false, nil, false
 		}
-		line := strings.TrimSuffix(string(p.payload), "\n")
-		if i == 0 {
-			if nul := strings.IndexByte(line, 0); nul >= 0 {
-				caps := line[nul+1:]
-				line = line[:nul]
-				if strings.Contains(caps, "side-band-64k") {
-					sideband = true
+		pktLen = (pktLen << 4) | int(d)
+	}
+	if pktLen < 87 || pktLen+4 > len(body) {
+		return false, nil, false
+	}
+	if body[pktLen] != '0' || body[pktLen+1] != '0' || body[pktLen+2] != '0' || body[pktLen+3] != '0' {
+		return false, nil, false
+	}
+	pay := body[4:pktLen]
+	if len(pay) > 0 && pay[len(pay)-1] == '\n' {
+		pay = pay[:len(pay)-1]
+	}
+	if len(pay) < 83 || pay[40] != ' ' || pay[81] != ' ' {
+		return false, nil, false
+	}
+	oldOID, ok1 := ParseOIDBytes(pay[0:40])
+	newOID, ok2 := ParseOIDBytes(pay[41:81])
+	if !ok1 || !ok2 {
+		return false, nil, false
+	}
+	rest := pay[82:]
+	if nul := bytes.IndexByte(rest, 0); nul >= 0 {
+		caps := rest[nul+1:]
+		rest = rest[:nul]
+		sideband = bytes.Contains(caps, []byte("side-band-64k"))
+	}
+	if len(rest) == 0 {
+		return false, nil, false
+	}
+	out.oldOID = oldOID
+	out.newOID = newOID
+	if bytes.Equal(rest, []byte("refs/heads/main")) {
+		out.ref = "refs/heads/main"
+	} else {
+		out.ref = string(rest)
+	}
+	return sideband, body[pktLen+4:], true
+}
+
+func handleReceivePack(w *http1.ResponseWriter, r *http1.Request, repo *store.Repo) {
+	var singleCmd [1]receiveCmd
+	var cmds []receiveCmd
+	var packBytes []byte
+	var sideband bool
+
+	if sb, pb, ok := parseSingleReceiveCmd(r.Body, &singleCmd[0]); ok {
+		sideband = sb
+		packBytes = pb
+		cmds = singleCmd[:1]
+	} else {
+		var pktStack [16]pkt
+		pkts, pb, err := parsePktLinesInto(r.Body, pktStack[:0], true)
+		if err != nil {
+			_ = w.WriteJSON(400, []byte(`{"message":"Malformed receive-pack request"}`+"\n"))
+			return
+		}
+		packBytes = pb
+		for i, p := range pkts {
+			if p.kind != pktKindData {
+				continue
+			}
+			line := strings.TrimSuffix(string(p.payload), "\n")
+			if i == 0 {
+				if nul := strings.IndexByte(line, 0); nul >= 0 {
+					caps := line[nul+1:]
+					line = line[:nul]
+					if strings.Contains(caps, "side-band-64k") {
+						sideband = true
+					}
 				}
 			}
+			parts := strings.SplitN(line, " ", 3)
+			if len(parts) != 3 {
+				_ = w.WriteJSON(400, []byte(`{"message":"Malformed command line"}`+"\n"))
+				return
+			}
+			oldOID, ok1 := ParseOID(parts[0])
+			newOID, ok2 := ParseOID(parts[1])
+			if !ok1 || !ok2 {
+				_ = w.WriteJSON(400, []byte(`{"message":"Invalid oid in push command"}`+"\n"))
+				return
+			}
+			cmds = append(cmds, receiveCmd{oldOID: oldOID, newOID: newOID, ref: parts[2]})
 		}
-		parts := strings.SplitN(line, " ", 3)
-		if len(parts) != 3 {
-			_ = w.WriteJSON(400, []byte(`{"message":"Malformed command line"}`+"\n"))
-			return
-		}
-		oldOID, ok1 := ParseOID(parts[0])
-		newOID, ok2 := ParseOID(parts[1])
-		if !ok1 || !ok2 {
-			_ = w.WriteJSON(400, []byte(`{"message":"Invalid oid in push command"}`+"\n"))
-			return
-		}
-		cmds = append(cmds, receiveCmd{oldOID: oldOID, newOID: newOID, ref: parts[2]})
 	}
 
 	var unpackErr error
@@ -884,7 +963,13 @@ func handleReceivePack(w *http1.ResponseWriter, r *http1.Request, repo *store.Re
 		ok     bool
 		reason string
 	}
-	results := make([]refResult, len(cmds))
+	var stackResults [4]refResult
+	var results []refResult
+	if len(cmds) <= len(stackResults) {
+		results = stackResults[:len(cmds)]
+	} else {
+		results = make([]refResult, len(cmds))
+	}
 	anyChanged := false
 
 	if unpackErr == nil {
@@ -933,10 +1018,29 @@ func handleReceivePack(w *http1.ResponseWriter, r *http1.Request, repo *store.Re
 			anyChanged = true
 		}
 		if anyChanged {
-			repo.InvalidateGitCaches()
+			if len(repo.Refs) == 1 {
+				if mainOID, ok := repo.Refs["refs/heads/main"]; ok {
+					repo.CachedLsRefsDefault.Store(nil)
+					repo.CachedShallowClone.Store(nil)
+					repo.UpdateSingleMainRecvAdvLocked(mainOID)
+				} else {
+					repo.InvalidateGitCaches()
+				}
+			} else {
+				repo.InvalidateGitCaches()
+			}
 		}
 	}
 	repo.GitMu.Unlock()
+
+	if !r.Close && unpackErr == nil && len(results) == 1 && results[0].ok && results[0].ref == "refs/heads/main" {
+		if sideband {
+			_ = w.WriteRaw(prebakedPushOkMainSideband)
+		} else {
+			_ = w.WriteRaw(prebakedPushOkMainPlain)
+		}
+		return
+	}
 
 	var report []byte
 	if unpackErr != nil {
@@ -965,7 +1069,5 @@ func handleReceivePack(w *http1.ResponseWriter, r *http1.Request, repo *store.Re
 		body = report
 	}
 
-	_ = w.WriteResponse(200, "application/x-git-receive-pack-result", []http1.Header{
-		{Name: "Cache-Control", Value: "no-cache"},
-	}, body)
+	_ = w.WriteGitResponse(200, "application/x-git-receive-pack-result", body)
 }

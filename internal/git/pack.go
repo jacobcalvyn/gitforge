@@ -32,6 +32,13 @@ var zlibWriterPool = sync.Pool{
 	},
 }
 
+var zlibBestCompPool = sync.Pool{
+	New: func() any {
+		w, _ := zlib.NewWriterLevel(io.Discard, zlib.BestCompression)
+		return w
+	},
+}
+
 // sliceReader implements io.Reader and io.ByteReader over a []byte without heap allocation,
 // so compress/zlib never allocates an internal bufio.Reader and stops at the exact stream boundary.
 type sliceReader struct {
@@ -99,7 +106,7 @@ func readOfsDeltaOffset(buf []byte, off int) (back int, next int, err error) {
 	return int(val), off, nil
 }
 
-func inflatePackEntry(data []byte, expectedSize int) (out []byte, consumed int, err error) {
+func inflatePackEntryInto(r *store.Repo, data []byte, expectedSize int) (out []byte, consumed int, err error) {
 	sr := sliceReader{b: data}
 	var zr io.ReadCloser
 	if pooled := zlibReaderPool.Get(); pooled != nil {
@@ -117,29 +124,35 @@ func inflatePackEntry(data []byte, expectedSize int) (out []byte, consumed int, 
 			return nil, 0, err
 		}
 	}
-	defer func() {
-		_ = zr.Close()
-		zlibReaderPool.Put(zr)
-	}()
 
-	out = make([]byte, expectedSize)
 	if expectedSize > 0 {
+		if r != nil {
+			out = r.AllocBytes(expectedSize)
+		} else {
+			out = make([]byte, expectedSize)
+		}
 		if _, err = io.ReadFull(zr, out); err != nil {
+			_ = zr.Close()
+			zlibReaderPool.Put(zr)
 			return nil, 0, err
 		}
 	}
 	// Trigger EOF + Adler-32 trailer verification.
 	var extra [1]byte
-	n, err := zr.Read(extra[:])
-	if n > 0 || (err != nil && err != io.EOF) {
-		if err == nil {
+	n, rerr := zr.Read(extra[:])
+	if n > 0 || (rerr != nil && rerr != io.EOF) {
+		_ = zr.Close()
+		zlibReaderPool.Put(zr)
+		if rerr == nil {
 			return nil, 0, errors.New("inflated pack object larger than declared size")
 		}
-		return nil, 0, err
+		return nil, 0, rerr
 	}
-	if err = zr.Close(); err != nil {
-		return nil, 0, err
+	if cerr := zr.Close(); cerr != nil {
+		zlibReaderPool.Put(zr)
+		return nil, 0, cerr
 	}
+	zlibReaderPool.Put(zr)
 	return out, sr.pos, nil
 }
 
@@ -331,7 +344,7 @@ func ParsePackAndStoreLocked(r *store.Repo, pack []byte) error {
 			return fmt.Errorf("unknown pack object type %d", tc)
 		}
 
-		inflated, consumed, err := inflatePackEntry(pack[off:trailerStart], sz)
+		inflated, consumed, err := inflatePackEntryInto(r, pack[off:trailerStart], sz)
 		if err != nil {
 			return fmt.Errorf("pack entry %d inflate: %w", i, err)
 		}
@@ -412,19 +425,22 @@ func ParsePackAndStoreLocked(r *store.Repo, pack []byte) error {
 	newCommits := stackCommits[:0]
 	for i := range entries {
 		e := &entries[i]
-		if err := resolve(e); err != nil {
-			return err
+		if hasDeltas {
+			if err := resolve(e); err != nil {
+				return err
+			}
+		} else {
+			e.resolvedType = store.ObjType(e.typeCode)
+			e.resolvedData = e.data
+			e.oid = HashObject(e.resolvedType, e.resolvedData)
 		}
 		if _, exists := r.Objects[e.oid]; !exists {
-			r.Objects[e.oid] = &store.GitObject{
-				Type: e.resolvedType,
-				Data: e.resolvedData,
-			}
+			r.Objects[e.oid] = r.AllocGitObject(e.resolvedType, e.resolvedData)
 		}
 		if e.resolvedType == store.ObjCommit {
 			if _, exists := r.Commits[e.oid]; !exists {
-				info, err := ParseCommit(e.resolvedData)
-				if err != nil {
+				info := r.AllocCommitInfo()
+				if err := ParseCommitFastInto(e.resolvedData, info); err != nil {
 					return err
 				}
 				r.Commits[e.oid] = info
@@ -434,7 +450,18 @@ func ParsePackAndStoreLocked(r *store.Repo, pack []byte) error {
 	}
 
 	// Compute commit heights accurately regardless of commit order inside the pack.
-	if len(newCommits) > 0 {
+	if len(newCommits) == 1 {
+		ci := r.Commits[newCommits[0]]
+		if ci != nil && ci.Height == 0 {
+			var maxP uint32
+			for _, p := range ci.Parents {
+				if pi := r.Commits[p]; pi != nil && pi.Height > maxP {
+					maxP = pi.Height
+				}
+			}
+			ci.Height = maxP + 1
+		}
+	} else if len(newCommits) > 1 {
 		var calcHeight func(oid [20]byte) uint32
 		calcHeight = func(oid [20]byte) uint32 {
 			ci := r.Commits[oid]
@@ -472,15 +499,24 @@ func appendPackObjHeader(dst []byte, objType store.ObjType, size int) []byte {
 	return append(dst, first)
 }
 
-// WritePack serializes objects into a valid v2 Git packfile with pooled BestSpeed zlib.
+// WritePack serializes objects into a valid v2 Git packfile using fast zlib compression.
 func WritePack(objects []*store.GitObject) ([]byte, error) {
+	return WritePackLevel(objects, zlib.BestSpeed)
+}
+
+// WritePackLevel serializes objects into a valid v2 Git packfile at the requested zlib level.
+func WritePackLevel(objects []*store.GitObject, level int) ([]byte, error) {
 	est := 32 + len(objects)*64
 	out := make([]byte, 12, est)
 	copy(out[:4], "PACK")
 	binary.BigEndian.PutUint32(out[4:8], 2)
 	binary.BigEndian.PutUint32(out[8:12], uint32(len(objects)))
 
-	zw := zlibWriterPool.Get().(*zlib.Writer)
+	pool := &zlibWriterPool
+	if level == zlib.BestCompression {
+		pool = &zlibBestCompPool
+	}
+	zw := pool.Get().(*zlib.Writer)
 	var zbuf bytes.Buffer
 	zbuf.Grow(4096)
 
@@ -489,16 +525,16 @@ func WritePack(objects []*store.GitObject) ([]byte, error) {
 		zbuf.Reset()
 		zw.Reset(&zbuf)
 		if _, err := zw.Write(obj.Data); err != nil {
-			zlibWriterPool.Put(zw)
+			pool.Put(zw)
 			return nil, err
 		}
 		if err := zw.Close(); err != nil {
-			zlibWriterPool.Put(zw)
+			pool.Put(zw)
 			return nil, err
 		}
 		out = append(out, zbuf.Bytes()...)
 	}
-	zlibWriterPool.Put(zw)
+	pool.Put(zw)
 
 	h := sha1Pool.Get().(hash.Hash)
 	h.Reset()

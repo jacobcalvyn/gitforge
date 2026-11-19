@@ -1168,10 +1168,9 @@ func (e *execCtx) resolveField(typeName string, obj any, field string, args map[
 
 	case "Issue":
 		iss := obj.(*store.Issue)
-		iss.RepoOwner = iss.RepoOwner // keep reference clean
 		switch field {
 		case "id":
-			return iss.GlobalID
+			return iss.NodeID()
 		case "databaseId":
 			return iss.ID
 		case "number":

@@ -30,8 +30,9 @@ import (
 
 func main() {
 	runtime.GOMAXPROCS(2)
-	debug.SetGCPercent(800)
-	debug.SetMemoryLimit(700 << 20)
+	debug.SetGCPercent(-1)
+	debug.SetMemoryLimit(750 << 20)
+	signal.Ignore(syscall.SIGPIPE)
 
 	listenFlag := flag.String("listen", "", "Listen address (local standalone mode, e.g. 127.0.0.1:8080)")
 	tokenFlag := flag.String("token", "", "Bearer token override (defaults to MAKEFUN_SHOP_TOKEN)")
@@ -142,7 +143,7 @@ func main() {
 	}
 	fmt.Println("[entry] registered; waiting for the env to say done")
 
-	waitForDone(envURL)
+	waitForDone(envURL, srv)
 	srv.Close(ln)
 	fmt.Println("[entry] done")
 }
@@ -198,34 +199,213 @@ func registerWithEnv(envURL string, port int) error {
 	}
 }
 
-func waitForDone(envURL string) {
+type envClient struct {
+	dialHost string
+	reqBytes []byte
+	conn     net.Conn
+	br       *bufio.Reader
+}
+
+func newEnvClient(doneURL string) (*envClient, error) {
+	u, err := url.Parse(doneURL)
+	if err != nil {
+		return nil, err
+	}
+	host := u.Host
+	if !strings.Contains(host, ":") {
+		host += ":80"
+	}
+	path := u.RequestURI()
+	if path == "" {
+		path = "/done"
+	}
+	var req bytes.Buffer
+	fmt.Fprintf(&req, "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive\r\n\r\n", path, u.Host)
+	return &envClient{
+		dialHost: host,
+		reqBytes: req.Bytes(),
+	}, nil
+}
+
+func (ec *envClient) closeConn() {
+	if ec.conn != nil {
+		_ = ec.conn.Close()
+		ec.conn = nil
+	}
+}
+
+func (ec *envClient) getDoneOnce(timeout time.Duration) (int, []byte, error) {
+	if ec.conn == nil {
+		conn, err := net.DialTimeout("tcp", ec.dialHost, timeout)
+		if err != nil {
+			return 0, nil, err
+		}
+		ec.conn = conn
+		if ec.br == nil {
+			ec.br = bufio.NewReaderSize(conn, 4096)
+		} else {
+			ec.br.Reset(conn)
+		}
+	}
+	_ = ec.conn.SetDeadline(time.Now().Add(timeout))
+	if _, err := ec.conn.Write(ec.reqBytes); err != nil {
+		ec.closeConn()
+		return 0, nil, err
+	}
+	status, body, closeConn, err := readHTTPResponse(ec.br)
+	if err != nil || closeConn {
+		ec.closeConn()
+	}
+	return status, body, err
+}
+
+func (ec *envClient) getDone(timeout time.Duration) (int, []byte, error) {
+	wasReused := ec.conn != nil
+	status, body, err := ec.getDoneOnce(timeout)
+	if err != nil && wasReused {
+		return ec.getDoneOnce(timeout)
+	}
+	return status, body, err
+}
+
+func waitForDone(envURL string, srv *http1.Server) {
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 
-	for attempt := 0; ; attempt++ {
+	ec, ecErr := newEnvClient(envURL + "/done")
+	if ec != nil {
+		defer ec.closeConn()
+	}
+
+	var lastSeq uint64 = srv.ActivitySeq.Load()
+	for attempt := 0; ; {
 		select {
 		case <-sigCh:
 			return
 		default:
 		}
-		status, respBody, err := httpDo("GET", envURL+"/done", nil, 30*time.Second)
-		if err == nil && status >= 200 && status < 300 {
-			var parsed struct {
-				Done bool `json:"done"`
-			}
-			if json.Unmarshal(respBody, &parsed) == nil && parsed.Done {
-				return
-			}
+		time.Sleep(350 * time.Millisecond)
+
+		curSeq := srv.ActivitySeq.Load()
+		if curSeq != lastSeq {
+			lastSeq = curSeq
 			attempt = 0
-			time.Sleep(250 * time.Millisecond)
 			continue
 		}
+
+		var status int
+		var respBody []byte
+		var err error
+		if ecErr == nil {
+			status, respBody, err = ec.getDone(30 * time.Second)
+		} else {
+			status, respBody, err = httpDo("GET", envURL+"/done", nil, 30*time.Second)
+		}
+		if err == nil && status >= 200 && status < 300 {
+			if bytes.Contains(respBody, []byte("true")) {
+				var parsed struct {
+					Done bool `json:"done"`
+				}
+				if json.Unmarshal(respBody, &parsed) == nil && parsed.Done {
+					return
+				}
+			}
+			attempt = 0
+			continue
+		}
+		attempt++
 		time.Sleep(retryDelay(attempt))
 	}
 }
 
-// httpDo is a minimal pure-TCP HTTP/1.1 client for MAKEFUN_ENV_URL (/register and /done),
+func readHTTPResponse(br *bufio.Reader) (status int, body []byte, shouldClose bool, err error) {
+	statusLine, err := br.ReadString('\n')
+	if err != nil {
+		return 0, nil, true, err
+	}
+	parts := strings.SplitN(strings.TrimSpace(statusLine), " ", 3)
+	if len(parts) < 2 {
+		return 0, nil, true, errors.New("malformed HTTP status line")
+	}
+	status, err = strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, nil, true, err
+	}
+
+	cl := -1
+	chunked := false
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return 0, nil, true, err
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			break
+		}
+		if colon := strings.IndexByte(trimmed, ':'); colon > 0 {
+			k := strings.TrimSpace(trimmed[:colon])
+			v := strings.TrimSpace(trimmed[colon+1:])
+			if strings.EqualFold(k, "Content-Length") {
+				cl, _ = strconv.Atoi(v)
+			} else if strings.EqualFold(k, "Transfer-Encoding") && strings.Contains(strings.ToLower(v), "chunked") {
+				chunked = true
+			} else if strings.EqualFold(k, "Connection") && strings.EqualFold(v, "close") {
+				shouldClose = true
+			}
+		}
+	}
+
+	if chunked {
+		var out bytes.Buffer
+		for {
+			szLine, err := br.ReadString('\n')
+			if err != nil {
+				return status, out.Bytes(), true, err
+			}
+			szText := strings.TrimSpace(szLine)
+			if semi := strings.IndexByte(szText, ';'); semi >= 0 {
+				szText = strings.TrimSpace(szText[:semi])
+			}
+			n, err := strconv.ParseInt(szText, 16, 64)
+			if err != nil {
+				return status, out.Bytes(), true, err
+			}
+			if n == 0 {
+				// Consume trailer lines until blank line to keep socket synchronized.
+				for {
+					tl, err := br.ReadString('\n')
+					if err != nil || strings.TrimSpace(tl) == "" {
+						break
+					}
+				}
+				return status, out.Bytes(), shouldClose, nil
+			}
+			chunk := make([]byte, n)
+			if _, err := io.ReadFull(br, chunk); err != nil {
+				return status, out.Bytes(), true, err
+			}
+			out.Write(chunk)
+			_, _ = br.ReadString('\n')
+		}
+	}
+
+	if cl >= 0 {
+		out := make([]byte, cl)
+		if cl > 0 {
+			if _, err := io.ReadFull(br, out); err != nil {
+				return status, nil, true, err
+			}
+		}
+		return status, out, shouldClose, nil
+	}
+
+	out, err := io.ReadAll(br)
+	return status, out, true, err
+}
+
+// httpDo is a minimal pure-TCP HTTP/1.1 client for MAKEFUN_ENV_URL (/register fallback),
 // avoiding net/http + crypto/tls to keep the compiled static binary compact.
 func httpDo(method, rawURL string, body []byte, timeout time.Duration) (int, []byte, error) {
 	u, err := url.Parse(rawURL)
@@ -262,79 +442,6 @@ func httpDo(method, rawURL string, body []byte, timeout time.Duration) (int, []b
 	}
 
 	br := bufio.NewReader(conn)
-	statusLine, err := br.ReadString('\n')
-	if err != nil {
-		return 0, nil, err
-	}
-	parts := strings.SplitN(strings.TrimSpace(statusLine), " ", 3)
-	if len(parts) < 2 {
-		return 0, nil, errors.New("malformed HTTP status line")
-	}
-	status, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return 0, nil, err
-	}
-
-	cl := -1
-	chunked := false
-	for {
-		line, err := br.ReadString('\n')
-		if err != nil {
-			return 0, nil, err
-		}
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			break
-		}
-		if colon := strings.IndexByte(trimmed, ':'); colon > 0 {
-			k := strings.TrimSpace(trimmed[:colon])
-			v := strings.TrimSpace(trimmed[colon+1:])
-			if strings.EqualFold(k, "Content-Length") {
-				cl, _ = strconv.Atoi(v)
-			} else if strings.EqualFold(k, "Transfer-Encoding") && strings.Contains(strings.ToLower(v), "chunked") {
-				chunked = true
-			}
-		}
-	}
-
-	if chunked {
-		var out bytes.Buffer
-		for {
-			szLine, err := br.ReadString('\n')
-			if err != nil {
-				return status, out.Bytes(), err
-			}
-			szText := strings.TrimSpace(szLine)
-			if semi := strings.IndexByte(szText, ';'); semi >= 0 {
-				szText = strings.TrimSpace(szText[:semi])
-			}
-			n, err := strconv.ParseInt(szText, 16, 64)
-			if err != nil {
-				return status, out.Bytes(), err
-			}
-			if n == 0 {
-				break
-			}
-			chunk := make([]byte, n)
-			if _, err := io.ReadFull(br, chunk); err != nil {
-				return status, out.Bytes(), err
-			}
-			out.Write(chunk)
-			_, _ = br.ReadString('\n')
-		}
-		return status, out.Bytes(), nil
-	}
-
-	if cl >= 0 {
-		out := make([]byte, cl)
-		if cl > 0 {
-			if _, err := io.ReadFull(br, out); err != nil {
-				return status, nil, err
-			}
-		}
-		return status, out, nil
-	}
-
-	out, err := io.ReadAll(br)
+	status, out, _, err := readHTTPResponse(br)
 	return status, out, err
 }

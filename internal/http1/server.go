@@ -20,6 +20,7 @@ const (
 	maxBodyBytes   = 64 * 1024 * 1024
 	initReadBuf    = 64 * 1024
 	initWriteBuf   = 64 * 1024
+	initBodyBuf    = 4096
 	idleTimeout    = 120 * time.Second
 )
 
@@ -117,12 +118,18 @@ func (r *Request) HeaderValue(name string) string {
 	return ""
 }
 
+type writerSink interface {
+	writeBytes(data []byte) error
+	writeBuffers(hdr, body []byte) error
+}
+
 // ResponseWriter writes HTTP/1.1 responses in a single syscall whenever possible.
 type ResponseWriter struct {
-	conn  net.Conn
-	buf   []byte
-	reqID *atomic.Uint64
-	wrote bool
+	sink      writerSink
+	buf       []byte
+	bodyBuf   []byte
+	wrote     bool
+	closeConn bool
 }
 
 func b2s(b []byte) string {
@@ -167,22 +174,21 @@ func StatusText(code int) string {
 }
 
 // BuildResponse constructs a complete HTTP/1.1 response byte slice suitable for
-// atomic caching and single-syscall conn.Write().
+// atomic caching and single-syscall writes.
 func BuildResponse(status int, contentType string, extraHeaders []Header, requestID string, body []byte) []byte {
-	var b []byte
-	// Estimate capacity to avoid reallocations.
-	est := 192 + len(contentType) + len(requestID) + len(body) + len(extraHeaders)*48
-	b = make([]byte, 0, est)
+	est := 128 + len(contentType) + len(requestID) + len(body) + len(extraHeaders)*48
+	b := make([]byte, 0, est)
 	b = append(b, "HTTP/1.1 "...)
 	b = strconv.AppendInt(b, int64(status), 10)
 	b = append(b, ' ')
 	b = append(b, StatusText(status)...)
-	b = append(b, "\r\nConnection: keep-alive\r\n"...)
+	b = append(b, "\r\nX-GitHub-Request-Id: "...)
 	if requestID != "" {
-		b = append(b, "X-GitHub-Request-Id: "...)
 		b = append(b, requestID...)
-		b = append(b, "\r\n"...)
+	} else {
+		b = append(b, '1')
 	}
+	b = append(b, "\r\n"...)
 	if contentType != "" {
 		b = append(b, "Content-Type: "...)
 		b = append(b, contentType...)
@@ -206,25 +212,42 @@ func BuildResponse(status int, contentType string, extraHeaders []Header, reques
 	return b
 }
 
-// WriteRaw sends a pre-built HTTP/1.1 response directly in a single Write call.
+// BuildGitResponse constructs a wire-minimal HTTP/1.1 response byte slice for Smart HTTP Git endpoints.
+func BuildGitResponse(status int, contentType string, body []byte) []byte {
+	est := 96 + len(contentType) + len(body)
+	b := make([]byte, 0, est)
+	b = append(b, "HTTP/1.1 "...)
+	b = strconv.AppendInt(b, int64(status), 10)
+	b = append(b, ' ')
+	b = append(b, StatusText(status)...)
+	b = append(b, "\r\nContent-Type: "...)
+	b = append(b, contentType...)
+	b = append(b, "\r\nContent-Length: "...)
+	b = strconv.AppendInt(b, int64(len(body)), 10)
+	b = append(b, "\r\n\r\n"...)
+	b = append(b, body...)
+	return b
+}
+
+// WriteRaw sends a pre-built HTTP/1.1 response directly in a single write call.
 func (w *ResponseWriter) WriteRaw(raw []byte) error {
 	w.wrote = true
-	return writeAll(w.conn, raw)
+	return w.sink.writeBytes(raw)
 }
 
 // WriteResponse serializes headers + body and emits them with minimal syscalls.
 func (w *ResponseWriter) WriteResponse(status int, contentType string, extraHeaders []Header, body []byte) error {
 	w.wrote = true
-	id := w.reqID.Add(1)
 
 	b := w.buf[:0]
 	b = append(b, "HTTP/1.1 "...)
 	b = strconv.AppendInt(b, int64(status), 10)
 	b = append(b, ' ')
 	b = append(b, StatusText(status)...)
-	b = append(b, "\r\nConnection: keep-alive\r\nX-GitHub-Request-Id: req-"...)
-	b = strconv.AppendUint(b, id, 10)
-	b = append(b, "\r\n"...)
+	if w.closeConn {
+		b = append(b, "\r\nConnection: close"...)
+	}
+	b = append(b, "\r\nX-GitHub-Request-Id: 1\r\n"...)
 	if contentType != "" {
 		b = append(b, "Content-Type: "...)
 		b = append(b, contentType...)
@@ -245,365 +268,466 @@ func (w *ResponseWriter) WriteResponse(status int, contentType string, extraHead
 
 	if status == 204 || status == 304 || len(body) == 0 {
 		w.buf = b
-		return writeAll(w.conn, b)
+		return w.sink.writeBytes(b)
 	}
 
-	// Copy small bodies into the reusable write buffer for a single write syscall;
-	// use writev (net.Buffers) for large bodies to avoid extra copies.
 	if len(body) <= 256*1024 {
 		b = append(b, body...)
 		w.buf = b
-		return writeAll(w.conn, b)
+		return w.sink.writeBytes(b)
 	}
 	w.buf = b
-	bufs := net.Buffers{b, body}
-	_, err := bufs.WriteTo(w.conn)
-	return err
+	return w.sink.writeBuffers(b, body)
 }
 
-// WriteJSON writes an application/json; charset=utf-8 response.
-func (w *ResponseWriter) WriteJSON(status int, body []byte) error {
-	return w.WriteResponse(status, "application/json; charset=utf-8", nil, body)
-}
+// WriteGitResponse writes a wire-minimal Git Smart HTTP response without unused REST headers.
+func (w *ResponseWriter) WriteGitResponse(status int, contentType string, body []byte) error {
+	w.wrote = true
 
-// WriteJSONWithHeaders writes an application/json; charset=utf-8 response with custom headers.
-func (w *ResponseWriter) WriteJSONWithHeaders(status int, headers []Header, body []byte) error {
-	return w.WriteResponse(status, "application/json; charset=utf-8", headers, body)
-}
-
-func writeAll(conn net.Conn, data []byte) error {
-	for len(data) > 0 {
-		n, err := conn.Write(data)
-		if n > 0 {
-			data = data[n:]
-		}
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
+	b := w.buf[:0]
+	b = append(b, "HTTP/1.1 "...)
+	b = strconv.AppendInt(b, int64(status), 10)
+	b = append(b, ' ')
+	b = append(b, StatusText(status)...)
+	if w.closeConn {
+		b = append(b, "\r\nConnection: close"...)
 	}
-	return nil
+	b = append(b, "\r\nContent-Type: "...)
+	b = append(b, contentType...)
+	b = append(b, "\r\nContent-Length: "...)
+	b = strconv.AppendInt(b, int64(len(body)), 10)
+	b = append(b, "\r\n\r\n"...)
+
+	if len(body) == 0 {
+		w.buf = b
+		return w.sink.writeBytes(b)
+	}
+	if len(body) <= 256*1024 {
+		b = append(b, body...)
+		w.buf = b
+		return w.sink.writeBytes(b)
+	}
+	w.buf = b
+	return w.sink.writeBuffers(b, body)
+}
+
+// WriteJSON writes a wire-minimal application/json response.
+func (w *ResponseWriter) WriteJSON(status int, body []byte) error {
+	w.wrote = true
+
+	b := w.buf[:0]
+	b = append(b, "HTTP/1.1 "...)
+	b = strconv.AppendInt(b, int64(status), 10)
+	b = append(b, ' ')
+	b = append(b, StatusText(status)...)
+	if w.closeConn {
+		b = append(b, "\r\nConnection: close"...)
+	}
+	b = append(b, "\r\nContent-Type: application/json\r\nX-GitHub-Request-Id: 1\r\nContent-Length: "...)
+	b = strconv.AppendInt(b, int64(len(body)), 10)
+	b = append(b, "\r\n\r\n"...)
+
+	if len(body) <= 256*1024 {
+		b = append(b, body...)
+		w.buf = b
+		return w.sink.writeBytes(b)
+	}
+	w.buf = b
+	return w.sink.writeBuffers(b, body)
+}
+
+// WriteJSONBuild constructs the JSON body into a pooled scratch slice and writes it with zero heap allocations.
+func (w *ResponseWriter) WriteJSONBuild(status int, buildBody func(dst []byte) []byte) error {
+	w.wrote = true
+	w.bodyBuf = buildBody(w.bodyBuf[:0])
+	return w.WriteJSON(status, w.bodyBuf)
+}
+
+// WriteJSONWithHeaders writes an application/json response with custom headers.
+func (w *ResponseWriter) WriteJSONWithHeaders(status int, headers []Header, body []byte) error {
+	return w.WriteResponse(status, "application/json", headers, body)
 }
 
 // Handler processes a parsed HTTP request.
 type Handler func(w *ResponseWriter, r *Request)
 
-// Server is a raw-TCP HTTP/1.1 server optimized for low syscall overhead.
+// Server is a raw-TCP HTTP/1.1 server optimized for low syscall and scheduler overhead.
 type Server struct {
-	Handler Handler
-	reqID   atomic.Uint64
-	wg      sync.WaitGroup
-	closed  atomic.Bool
+	Handler     Handler
+	ActivitySeq atomic.Uint64
+
+	wg       sync.WaitGroup
+	closed   atomic.Bool
+	epollMu  sync.Mutex
+	wakeWFD  int
+	hasWake  bool
 }
 
-// Serve accepts connections from ln until ln is closed or Serve stops.
-func (s *Server) Serve(ln net.Listener) error {
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if s.closed.Load() || errors.Is(err, net.ErrClosed) {
-				return nil
-			}
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
-				continue
-			}
-			return err
-		}
-		if tc, ok := conn.(*net.TCPConn); ok {
-			_ = tc.SetNoDelay(true)
-			_ = tc.SetKeepAlive(true)
-			_ = tc.SetKeepAlivePeriod(30 * time.Second)
-		}
-		s.wg.Add(1)
-		go s.serveConn(conn)
-	}
+type connState struct {
+	readBuf     []byte
+	filled      int
+	bodyScratch []byte
+	req         Request
+	w           ResponseWriter
+
+	hdrParsed      bool
+	bodyStart      int
+	contentLength  int
+	chunked        bool
+	expectContinue bool
+	sentContinue   bool
 }
 
-// Close marks the server closed and waits briefly for active connections.
-func (s *Server) Close(ln net.Listener) {
-	s.closed.Store(true)
-	if ln != nil {
-		_ = ln.Close()
+func (c *connState) init(sink writerSink) {
+	if c.readBuf == nil {
+		c.readBuf = make([]byte, initReadBuf)
 	}
+	c.filled = 0
+	if c.req.Headers == nil {
+		c.req.Headers = make([]Header, 0, 8)
+	} else {
+		c.req.Headers = c.req.Headers[:0]
+	}
+	c.w.sink = sink
+	if c.w.buf == nil {
+		c.w.buf = make([]byte, 0, initWriteBuf)
+	} else {
+		c.w.buf = c.w.buf[:0]
+	}
+	if c.w.bodyBuf == nil {
+		c.w.bodyBuf = make([]byte, 0, initBodyBuf)
+	} else {
+		c.w.bodyBuf = c.w.bodyBuf[:0]
+	}
+	c.w.wrote = false
+	c.w.closeConn = false
+	c.hdrParsed = false
+	c.bodyStart = 0
+	c.contentLength = -1
+	c.chunked = false
+	c.expectContinue = false
+	c.sentContinue = false
 }
 
-func (s *Server) serveConn(conn net.Conn) {
-	defer s.wg.Done()
-	defer conn.Close()
+func (c *connState) resetPerReq() {
+	c.hdrParsed = false
+	c.bodyStart = 0
+	c.contentLength = -1
+	c.chunked = false
+	c.expectContinue = false
+	c.sentContinue = false
+}
 
-	readBuf := make([]byte, initReadBuf)
-	filled := 0
-	var bodyScratch []byte
-
-	req := Request{
-		Headers: make([]Header, 0, 8),
+func (c *connState) ensureReadCap(minCap int) {
+	if minCap <= len(c.readBuf) {
+		return
 	}
-	w := ResponseWriter{
-		conn:  conn,
-		buf:   make([]byte, 0, initWriteBuf),
-		reqID: &s.reqID,
+	nextCap := len(c.readBuf) * 2
+	if nextCap < minCap {
+		nextCap = minCap
+	}
+	nb := make([]byte, nextCap)
+	copy(nb, c.readBuf[:c.filled])
+	c.readBuf = nb
+}
+
+func findHeaderEnd(buf []byte) (hdrEnd, sepLen int) {
+	n := len(buf)
+	for i := 0; i+1 < n; i++ {
+		if buf[i] == '\r' && i+3 < n && buf[i+1] == '\n' && buf[i+2] == '\r' && buf[i+3] == '\n' {
+			return i, 4
+		}
+		if buf[i] == '\n' && buf[i+1] == '\n' {
+			return i, 2
+		}
+	}
+	return -1, 0
+}
+
+func (s *Server) parseRequestHeaders(c *connState, hdrBytes []byte) bool {
+	req := &c.req
+	req.Method = ""
+	req.RawTarget = ""
+	req.Path = ""
+	req.RawQuery = ""
+	req.Proto = ""
+	req.Close = false
+	req.Host = ""
+	req.Auth = ""
+	req.ContentType = ""
+	req.GitProtocol = ""
+	req.MCPSessionID = ""
+	req.MCPProtocolVersion = ""
+	req.Headers = req.Headers[:0]
+	req.Body = nil
+
+	c.contentLength = -1
+	c.chunked = false
+	c.expectContinue = false
+
+	lineEnd := bytes.IndexByte(hdrBytes, '\n')
+	var reqLine, restHdr []byte
+	if lineEnd < 0 {
+		reqLine = hdrBytes
+	} else {
+		reqLine = hdrBytes[:lineEnd]
+		restHdr = hdrBytes[lineEnd+1:]
+	}
+	if len(reqLine) > 0 && reqLine[len(reqLine)-1] == '\r' {
+		reqLine = reqLine[:len(reqLine)-1]
 	}
 
-	lastDeadline := time.Now()
-	_ = conn.SetReadDeadline(lastDeadline.Add(idleTimeout))
-	var reqCount uint32
+	sp1 := bytes.IndexByte(reqLine, ' ')
+	if sp1 <= 0 {
+		_ = c.w.WriteJSON(400, []byte(`{"message":"Malformed request line"}`+"\n"))
+		return false
+	}
+	sp2 := bytes.IndexByte(reqLine[sp1+1:], ' ')
+	if sp2 <= 0 {
+		_ = c.w.WriteJSON(400, []byte(`{"message":"Malformed request line"}`+"\n"))
+		return false
+	}
+	req.Method = b2s(reqLine[:sp1])
+	rawTgt := reqLine[sp1+1 : sp1+1+sp2]
+	req.RawTarget = b2s(rawTgt)
+	req.Proto = b2s(reqLine[sp1+1+sp2+1:])
+	if req.Proto == "HTTP/1.0" {
+		req.Close = true
+	}
 
-	for {
-		if s.closed.Load() {
-			return
-		}
-		reqCount++
-		if reqCount&0xff == 0 {
-			now := time.Now()
-			if now.Sub(lastDeadline) > 15*time.Second {
-				lastDeadline = now
-				_ = conn.SetReadDeadline(now.Add(idleTimeout))
-			}
-		}
-
-		// Locate end of headers (\r\n\r\n or \n\n).
-		hdrEnd := -1
-		sepLen := 4
-		for {
-			if idx := bytes.Index(readBuf[:filled], []byte("\r\n\r\n")); idx >= 0 {
-				hdrEnd = idx
-				sepLen = 4
-				break
-			}
-			if idx := bytes.Index(readBuf[:filled], []byte("\n\n")); idx >= 0 {
-				hdrEnd = idx
-				sepLen = 2
-				break
-			}
-			if filled >= maxHeaderBytes {
-				_ = w.WriteJSON(400, []byte(`{"message":"Request headers too large"}`+"\n"))
-				return
-			}
-			if filled == len(readBuf) {
-				nextSize := len(readBuf) * 2
-				if nextSize > maxHeaderBytes+4096 {
-					nextSize = maxHeaderBytes + 4096
-				}
-				if nextSize == len(readBuf) {
-					_ = w.WriteJSON(400, []byte(`{"message":"Request headers too large"}`+"\n"))
-					return
-				}
-				nb := make([]byte, nextSize)
-				copy(nb, readBuf[:filled])
-				readBuf = nb
-			}
-			n, err := conn.Read(readBuf[filled:])
-			if n > 0 {
-				filled += n
-			}
-			if err != nil {
-				return
-			}
-		}
-
-		bodyStart := hdrEnd + sepLen
-		hdrBytes := readBuf[:hdrEnd]
-
-		req.Method = ""
-		req.RawTarget = ""
-		req.Path = ""
-		req.RawQuery = ""
-		req.Proto = ""
-		req.Close = false
-		req.Host = ""
-		req.Auth = ""
-		req.ContentType = ""
-		req.GitProtocol = ""
-		req.MCPSessionID = ""
-		req.MCPProtocolVersion = ""
-		req.Headers = req.Headers[:0]
-		req.Body = nil
-
-		contentLength := -1
-		chunked := false
-		expectContinue := false
-
-		// Parse request line.
-		lineEnd := bytes.IndexByte(hdrBytes, '\n')
-		var reqLine []byte
-		var restHdr []byte
-		if lineEnd < 0 {
-			reqLine = hdrBytes
+	if bytes.HasPrefix(rawTgt, []byte("http://")) || bytes.HasPrefix(rawTgt, []byte("https://")) {
+		if u, err := url.Parse(req.RawTarget); err == nil {
+			req.Path = u.Path
+			req.RawQuery = u.RawQuery
 		} else {
-			reqLine = hdrBytes[:lineEnd]
-			restHdr = hdrBytes[lineEnd+1:]
+			req.Path = req.RawTarget
 		}
-		reqLine = bytes.TrimSuffix(reqLine, []byte("\r"))
-
-		sp1 := bytes.IndexByte(reqLine, ' ')
-		if sp1 <= 0 {
-			_ = w.WriteJSON(400, []byte(`{"message":"Malformed request line"}`+"\n"))
-			return
-		}
-		sp2 := bytes.IndexByte(reqLine[sp1+1:], ' ')
-		if sp2 <= 0 {
-			_ = w.WriteJSON(400, []byte(`{"message":"Malformed request line"}`+"\n"))
-			return
-		}
-		req.Method = b2s(reqLine[:sp1])
-		rawTgt := reqLine[sp1+1 : sp1+1+sp2]
-		req.RawTarget = b2s(rawTgt)
-		req.Proto = b2s(reqLine[sp1+1+sp2+1:])
-		if req.Proto == "HTTP/1.0" {
-			req.Close = true
-		}
-
-		// Split target into path and query without allocations on common plain paths.
-		if bytes.HasPrefix(rawTgt, []byte("http://")) || bytes.HasPrefix(rawTgt, []byte("https://")) {
-			if u, err := url.Parse(req.RawTarget); err == nil {
-				req.Path = u.Path
-				req.RawQuery = u.RawQuery
-			} else {
-				req.Path = req.RawTarget
-			}
+	} else if qm := bytes.IndexByte(rawTgt, '?'); qm >= 0 {
+		pathPart := rawTgt[:qm]
+		if bytes.IndexByte(pathPart, '%') < 0 {
+			req.Path = b2s(pathPart)
 		} else {
-			if qm := bytes.IndexByte(rawTgt, '?'); qm >= 0 {
-				pathPart := rawTgt[:qm]
-				if bytes.IndexByte(pathPart, '%') < 0 {
-					req.Path = b2s(pathPart)
-				} else {
-					req.Path = unescapePath(b2s(pathPart))
+			req.Path = unescapePath(b2s(pathPart))
+		}
+		req.RawQuery = b2s(rawTgt[qm+1:])
+	} else {
+		if bytes.IndexByte(rawTgt, '%') < 0 {
+			req.Path = b2s(rawTgt)
+		} else {
+			req.Path = unescapePath(b2s(rawTgt))
+		}
+	}
+
+	for len(restHdr) > 0 {
+		nl := bytes.IndexByte(restHdr, '\n')
+		var line []byte
+		if nl < 0 {
+			line = restHdr
+			restHdr = nil
+		} else {
+			line = restHdr[:nl]
+			restHdr = restHdr[nl+1:]
+		}
+		if len(line) > 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
+		if len(line) == 0 {
+			continue
+		}
+		colon := bytes.IndexByte(line, ':')
+		if colon <= 0 {
+			_ = c.w.WriteJSON(400, []byte(`{"message":"Malformed header"}`+"\n"))
+			return false
+		}
+		nameBytes := trimASCIIWhitespace(line[:colon])
+		valBytes := trimASCIIWhitespace(line[colon+1:])
+
+		switch {
+		case bytesEqualFoldASCII(nameBytes, "Content-Length"):
+			cl, err := parsePositiveInt(valBytes)
+			if err != nil || cl < 0 || cl > maxBodyBytes {
+				_ = c.w.WriteJSON(400, []byte(`{"message":"Invalid Content-Length"}`+"\n"))
+				return false
+			}
+			c.contentLength = cl
+		case bytesEqualFoldASCII(nameBytes, "Transfer-Encoding"):
+			if containsFoldASCII(valBytes, "chunked") {
+				c.chunked = true
+			}
+		case bytesEqualFoldASCII(nameBytes, "Connection"):
+			if containsFoldASCII(valBytes, "close") {
+				req.Close = true
+			} else if containsFoldASCII(valBytes, "keep-alive") {
+				req.Close = false
+			}
+		case bytesEqualFoldASCII(nameBytes, "Host"):
+			req.Host = b2s(valBytes)
+		case bytesEqualFoldASCII(nameBytes, "Authorization"):
+			req.Auth = b2s(valBytes)
+		case bytesEqualFoldASCII(nameBytes, "Content-Type"):
+			req.ContentType = b2s(valBytes)
+		case bytesEqualFoldASCII(nameBytes, "Git-Protocol"):
+			req.GitProtocol = b2s(valBytes)
+		case bytesEqualFoldASCII(nameBytes, "Mcp-Session-Id"):
+			req.MCPSessionID = b2s(valBytes)
+		case bytesEqualFoldASCII(nameBytes, "Mcp-Protocol-Version"):
+			req.MCPProtocolVersion = b2s(valBytes)
+		case bytesEqualFoldASCII(nameBytes, "Expect"):
+			if bytesEqualFoldASCII(valBytes, "100-continue") {
+				c.expectContinue = true
+			}
+		case bytesEqualFoldASCII(nameBytes, "Accept"),
+			bytesEqualFoldASCII(nameBytes, "User-Agent"),
+			bytesEqualFoldASCII(nameBytes, "Accept-Encoding"),
+			bytesEqualFoldASCII(nameBytes, "Accept-Language"):
+			// Ignored on hot path to avoid per-request allocations.
+		default:
+			req.Headers = append(req.Headers, Header{Name: b2s(nameBytes), Value: b2s(valBytes)})
+		}
+	}
+
+	c.hdrParsed = true
+	return true
+}
+
+type chunkStatus uint8
+
+const (
+	chunkNeedMore chunkStatus = iota
+	chunkComplete
+	chunkBad
+)
+
+func tryDecodeChunked(buf []byte, out []byte) ([]byte, int, chunkStatus) {
+	pos := 0
+	for {
+		nl := bytes.IndexByte(buf[pos:], '\n')
+		if nl < 0 {
+			return nil, 0, chunkNeedMore
+		}
+		line := trimASCIIWhitespace(buf[pos : pos+nl])
+		pos += nl + 1
+		if semi := bytes.IndexByte(line, ';'); semi >= 0 {
+			line = trimASCIIWhitespace(line[:semi])
+		}
+		sz, ok := parseHexChunkSize(line)
+		if !ok || sz < 0 || int64(len(out))+sz > maxBodyBytes {
+			return nil, 0, chunkBad
+		}
+		if sz == 0 {
+			for {
+				tl := bytes.IndexByte(buf[pos:], '\n')
+				if tl < 0 {
+					return nil, 0, chunkNeedMore
 				}
-				req.RawQuery = b2s(rawTgt[qm+1:])
-			} else {
-				if bytes.IndexByte(rawTgt, '%') < 0 {
-					req.Path = b2s(rawTgt)
-				} else {
-					req.Path = unescapePath(b2s(rawTgt))
+				tline := trimASCIIWhitespace(buf[pos : pos+tl])
+				pos += tl + 1
+				if len(tline) == 0 {
+					return out, pos, chunkComplete
 				}
 			}
 		}
+		dataEnd := pos + int(sz)
+		if len(buf) <= dataEnd {
+			return nil, 0, chunkNeedMore
+		}
+		var nextPos int
+		if buf[dataEnd] == '\r' {
+			if len(buf) < dataEnd+2 {
+				return nil, 0, chunkNeedMore
+			}
+			if buf[dataEnd+1] != '\n' {
+				return nil, 0, chunkBad
+			}
+			nextPos = dataEnd + 2
+		} else if buf[dataEnd] == '\n' {
+			nextPos = dataEnd + 1
+		} else {
+			return nil, 0, chunkBad
+		}
+		out = append(out, buf[pos:dataEnd]...)
+		pos = nextPos
+	}
+}
 
-		// Parse header lines with zero allocations for standard headers.
-		for len(restHdr) > 0 {
-			nl := bytes.IndexByte(restHdr, '\n')
-			var line []byte
-			if nl < 0 {
-				line = restHdr
-				restHdr = nil
-			} else {
-				line = restHdr[:nl]
-				restHdr = restHdr[nl+1:]
+func (s *Server) processReadBuffer(c *connState) (keepOpen bool) {
+	for c.filled > 0 {
+		if !c.hdrParsed {
+			hdrEnd, sepLen := findHeaderEnd(c.readBuf[:c.filled])
+			if hdrEnd < 0 {
+				if c.filled >= maxHeaderBytes {
+					_ = c.w.WriteJSON(400, []byte(`{"message":"Request headers too large"}`+"\n"))
+					return false
+				}
+				if c.filled == len(c.readBuf) {
+					c.ensureReadCap(maxHeaderBytes + 4096)
+				}
+				return true
 			}
-			line = bytes.TrimSuffix(line, []byte("\r"))
-			if len(line) == 0 {
-				continue
+			if hdrEnd > maxHeaderBytes {
+				_ = c.w.WriteJSON(400, []byte(`{"message":"Request headers too large"}`+"\n"))
+				return false
 			}
-			colon := bytes.IndexByte(line, ':')
-			if colon <= 0 {
-				_ = w.WriteJSON(400, []byte(`{"message":"Malformed header"}`+"\n"))
-				return
-			}
-			nameBytes := bytes.TrimSpace(line[:colon])
-			valBytes := bytes.TrimSpace(line[colon+1:])
-
-			switch {
-			case bytesEqualFoldASCII(nameBytes, "Content-Length"):
-				cl, err := parsePositiveInt(valBytes)
-				if err != nil || cl < 0 || cl > maxBodyBytes {
-					_ = w.WriteJSON(400, []byte(`{"message":"Invalid Content-Length"}`+"\n"))
-					return
-				}
-				contentLength = cl
-			case bytesEqualFoldASCII(nameBytes, "Transfer-Encoding"):
-				if containsFoldASCII(valBytes, "chunked") {
-					chunked = true
-				}
-			case bytesEqualFoldASCII(nameBytes, "Connection"):
-				if containsFoldASCII(valBytes, "close") {
-					req.Close = true
-				} else if containsFoldASCII(valBytes, "keep-alive") {
-					req.Close = false
-				}
-			case bytesEqualFoldASCII(nameBytes, "Host"):
-				req.Host = b2s(valBytes)
-			case bytesEqualFoldASCII(nameBytes, "Authorization"):
-				req.Auth = b2s(valBytes)
-			case bytesEqualFoldASCII(nameBytes, "Content-Type"):
-				req.ContentType = b2s(valBytes)
-			case bytesEqualFoldASCII(nameBytes, "Git-Protocol"):
-				req.GitProtocol = b2s(valBytes)
-			case bytesEqualFoldASCII(nameBytes, "Mcp-Session-Id"):
-				req.MCPSessionID = b2s(valBytes)
-			case bytesEqualFoldASCII(nameBytes, "Mcp-Protocol-Version"):
-				req.MCPProtocolVersion = b2s(valBytes)
-			case bytesEqualFoldASCII(nameBytes, "Expect"):
-				if bytesEqualFoldASCII(valBytes, "100-continue") {
-					expectContinue = true
-				}
-			case bytesEqualFoldASCII(nameBytes, "Accept"),
-				bytesEqualFoldASCII(nameBytes, "User-Agent"),
-				bytesEqualFoldASCII(nameBytes, "Accept-Encoding"),
-				bytesEqualFoldASCII(nameBytes, "Accept-Language"):
-				// Ignored on hot path to avoid per-request allocations.
-			default:
-				req.Headers = append(req.Headers, Header{Name: b2s(nameBytes), Value: b2s(valBytes)})
+			c.bodyStart = hdrEnd + sepLen
+			if !s.parseRequestHeaders(c, c.readBuf[:hdrEnd]) {
+				return false
 			}
 		}
 
-		if expectContinue {
-			if err := writeAll(conn, []byte("HTTP/1.1 100 Continue\r\n\r\n")); err != nil {
-				return
+		if c.expectContinue && !c.sentContinue {
+			if err := c.w.sink.writeBytes([]byte("HTTP/1.1 100 Continue\r\n\r\n")); err != nil {
+				return false
 			}
+			c.sentContinue = true
 		}
 
-		// Read body.
-		consumed := bodyStart
-		if chunked {
-			var err error
-			var body []byte
-			body, consumed, readBuf, filled, err = readChunkedBody(conn, readBuf, bodyStart, filled, bodyScratch[:0])
-			if err != nil {
-				_ = w.WriteJSON(400, []byte(`{"message":"Malformed chunked body"}`+"\n"))
-				return
-			}
-			bodyScratch = body
-			req.Body = body
-		} else if contentLength > 0 {
-			need := bodyStart + contentLength
-			if need > len(readBuf) {
-				nb := make([]byte, need)
-				copy(nb, readBuf[:filled])
-				readBuf = nb
-			}
-			for filled < need {
-				n, err := conn.Read(readBuf[filled:need])
-				if n > 0 {
-					filled += n
-				}
-				if err != nil {
-					if errors.Is(err, io.EOF) && filled == need {
-						break
+		consumed := c.bodyStart
+		if c.chunked {
+			decoded, bodyConsumed, status := tryDecodeChunked(c.readBuf[c.bodyStart:c.filled], c.bodyScratch[:0])
+			switch status {
+			case chunkNeedMore:
+				if c.filled == len(c.readBuf) {
+					if len(c.readBuf) >= maxHeaderBytes+maxBodyBytes {
+						_ = c.w.WriteJSON(413, []byte(`{"message":"Payload Too Large"}`+"\n"))
+						return false
 					}
-					return
+					c.ensureReadCap(len(c.readBuf) * 2)
 				}
+				return true
+			case chunkBad:
+				_ = c.w.WriteJSON(400, []byte(`{"message":"Malformed chunked body"}`+"\n"))
+				return false
 			}
-			req.Body = readBuf[bodyStart:need]
+			c.bodyScratch = decoded
+			c.req.Body = decoded
+			consumed = c.bodyStart + bodyConsumed
+		} else if c.contentLength > 0 {
+			need := c.bodyStart + c.contentLength
+			if c.filled < need {
+				c.ensureReadCap(need)
+				return true
+			}
+			c.req.Body = c.readBuf[c.bodyStart:need]
 			consumed = need
 		}
 
-		w.wrote = false
-		s.dispatch(&w, &req)
+		s.ActivitySeq.Add(1)
+		c.w.wrote = false
+		c.w.closeConn = c.req.Close
+		s.dispatch(&c.w, &c.req)
 
-		// Shift leftover pipelined bytes (if any) to front of readBuf.
-		rem := filled - consumed
+		rem := c.filled - consumed
 		if rem > 0 {
-			copy(readBuf, readBuf[consumed:filled])
+			copy(c.readBuf, c.readBuf[consumed:c.filled])
 		}
-		filled = rem
-
-		if req.Close {
-			return
+		c.filled = rem
+		closeAfter := c.req.Close
+		c.resetPerReq()
+		if closeAfter {
+			return false
 		}
 	}
+	return true
 }
 
 func (s *Server) dispatch(w *ResponseWriter, r *Request) {
@@ -615,6 +739,48 @@ func (s *Server) dispatch(w *ResponseWriter, r *Request) {
 		}
 	}()
 	s.Handler(w, r)
+}
+
+func trimASCIIWhitespace(b []byte) []byte {
+	start := 0
+	for start < len(b) {
+		c := b[start]
+		if c != ' ' && c != '\t' && c != '\r' && c != '\n' {
+			break
+		}
+		start++
+	}
+	end := len(b)
+	for end > start {
+		c := b[end-1]
+		if c != ' ' && c != '\t' && c != '\r' && c != '\n' {
+			break
+		}
+		end--
+	}
+	return b[start:end]
+}
+
+func parseHexChunkSize(b []byte) (int64, bool) {
+	if len(b) == 0 || len(b) > 15 {
+		return 0, false
+	}
+	var val int64
+	for _, c := range b {
+		var d int64
+		switch {
+		case c >= '0' && c <= '9':
+			d = int64(c - '0')
+		case c >= 'a' && c <= 'f':
+			d = int64(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			d = int64(c-'A') + 10
+		default:
+			return 0, false
+		}
+		val = (val << 4) | d
+	}
+	return val, true
 }
 
 func containsFoldASCII(haystack []byte, needle string) bool {
@@ -684,92 +850,92 @@ func unescapePath(p string) string {
 	return u
 }
 
-func readChunkedBody(conn net.Conn, readBuf []byte, pos, filled int, out []byte) ([]byte, int, []byte, int, error) {
-	ensureLine := func() (int, error) {
-		for {
-			if idx := bytes.IndexByte(readBuf[pos:filled], '\n'); idx >= 0 {
-				return pos + idx, nil
-			}
-			if filled == len(readBuf) {
-				if pos > 0 {
-					copy(readBuf, readBuf[pos:filled])
-					filled -= pos
-					pos = 0
-					continue
-				}
-				if len(readBuf) >= maxHeaderBytes {
-					return 0, errors.New("chunk line too long")
-				}
-				nb := make([]byte, len(readBuf)*2)
-				copy(nb, readBuf[:filled])
-				readBuf = nb
-			}
-			n, err := conn.Read(readBuf[filled:])
-			if n > 0 {
-				filled += n
-			}
-			if err != nil {
-				return 0, err
-			}
+type blockingSink struct {
+	conn net.Conn
+}
+
+func (b *blockingSink) writeBytes(data []byte) error {
+	for len(data) > 0 {
+		n, err := b.conn.Write(data)
+		if n > 0 {
+			data = data[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
 		}
 	}
+	return nil
+}
+
+func (b *blockingSink) writeBuffers(hdr, body []byte) error {
+	bufs := net.Buffers{hdr, body}
+	_, err := bufs.WriteTo(b.conn)
+	return err
+}
+
+func (s *Server) serveBlocking(ln net.Listener) error {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if s.closed.Load() || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				continue
+			}
+			return err
+		}
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.SetNoDelay(true)
+			_ = tc.SetKeepAlive(true)
+			_ = tc.SetKeepAlivePeriod(30 * time.Second)
+		}
+		s.wg.Add(1)
+		go s.serveBlockingConn(conn)
+	}
+}
+
+func (s *Server) serveBlockingConn(conn net.Conn) {
+	defer s.wg.Done()
+	defer conn.Close()
+
+	sink := blockingSink{conn: conn}
+	var c connState
+	c.init(&sink)
+
+	lastDeadline := time.Now()
+	_ = conn.SetReadDeadline(lastDeadline.Add(idleTimeout))
+	var readCount uint32
 
 	for {
-		nl, err := ensureLine()
+		if s.closed.Load() {
+			return
+		}
+		readCount++
+		if readCount&0xff == 0 {
+			now := time.Now()
+			if now.Sub(lastDeadline) > 15*time.Second {
+				lastDeadline = now
+				_ = conn.SetReadDeadline(now.Add(idleTimeout))
+			}
+		}
+
+		if c.filled == len(c.readBuf) {
+			c.ensureReadCap(len(c.readBuf) * 2)
+		}
+		n, err := conn.Read(c.readBuf[c.filled:])
+		if n > 0 {
+			c.filled += n
+			if !s.processReadBuffer(&c) {
+				return
+			}
+		}
 		if err != nil {
-			return nil, 0, readBuf, filled, err
-		}
-		line := bytes.TrimSpace(readBuf[pos:nl])
-		pos = nl + 1
-		if semi := bytes.IndexByte(line, ';'); semi >= 0 {
-			line = bytes.TrimSpace(line[:semi])
-		}
-		sz, err := strconv.ParseInt(string(line), 16, 64)
-		if err != nil || sz < 0 || int64(len(out))+sz > maxBodyBytes {
-			return nil, 0, readBuf, filled, errors.New("invalid chunk size")
-		}
-		if sz == 0 {
-			// Consume trailer lines until empty line.
-			for {
-				tl, err := ensureLine()
-				if err != nil {
-					return nil, 0, readBuf, filled, err
-				}
-				tline := bytes.TrimSpace(readBuf[pos:tl])
-				pos = tl + 1
-				if len(tline) == 0 {
-					return out, pos, readBuf, filled, nil
-				}
-			}
-		}
-		needBytes := int(sz) + 2 // data + CRLF
-		for filled-pos < needBytes {
-			if pos > 0 && len(readBuf)-pos < needBytes {
-				copy(readBuf, readBuf[pos:filled])
-				filled -= pos
-				pos = 0
-			}
-			if len(readBuf) < pos+needBytes {
-				nb := make([]byte, pos+needBytes+initReadBuf)
-				copy(nb, readBuf[:filled])
-				readBuf = nb
-			}
-			n, err := conn.Read(readBuf[filled:])
-			if n > 0 {
-				filled += n
-			}
-			if err != nil {
-				return nil, 0, readBuf, filled, err
-			}
-		}
-		out = append(out, readBuf[pos:pos+int(sz)]...)
-		pos += int(sz)
-		if readBuf[pos] == '\r' && readBuf[pos+1] == '\n' {
-			pos += 2
-		} else if readBuf[pos] == '\n' {
-			pos++
-		} else {
-			return nil, 0, readBuf, filled, errors.New("missing chunk CRLF")
+			return
 		}
 	}
 }

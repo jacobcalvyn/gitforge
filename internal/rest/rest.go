@@ -1,6 +1,7 @@
 package rest
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"path"
@@ -17,40 +18,54 @@ import (
 func HandleREST(w *http1.ResponseWriter, r *http1.Request, st *store.Store) {
 	p := r.Path
 	// Hot path check first: GET /api/v3/repos/<owner>/<repo>/issues/<number>
-	if r.Method == "GET" && strings.HasPrefix(p, "/api/v3/repos/") {
+	// and POST /api/v3/repos/<owner>/<repo>/issues.
+	if strings.HasPrefix(p, "/api/v3/repos/") {
 		rest := p[len("/api/v3/repos/"):]
-		if idx := strings.Index(rest, "/issues/"); idx > 0 {
-			numPart := rest[idx+len("/issues/"):]
-			if len(numPart) > 0 && !strings.ContainsRune(numPart, '/') {
-				if num, ok := parseFastInt64(numPart); ok {
-					ownerRepo := rest[:idx]
-					if slash := strings.IndexByte(ownerRepo, '/'); slash > 0 && !strings.ContainsRune(ownerRepo[slash+1:], '/') {
-						owner := ownerRepo[:slash]
-						repoName := ownerRepo[slash+1:]
-						repo := st.GetRepo(owner, repoName)
-						if repo == nil {
-							writeErr(w, 404, "Not Found")
-							return
-						}
-						iss := repo.FastGetIssue(num)
-						if iss == nil {
-							writeErr(w, 404, "Not Found")
-							return
-						}
-						if raw := iss.CachedHTTP.Load(); raw != nil {
-							_ = w.WriteRaw(*raw)
-							return
-						}
-						repo.DataMu.RLock()
-						store.RebuildIssueCache(iss)
-						rawPtr := iss.CachedHTTP.Load()
-						repo.DataMu.RUnlock()
-						if rawPtr != nil {
-							_ = w.WriteRaw(*rawPtr)
-							return
+		if r.Method == "GET" {
+			if idx := strings.Index(rest, "/issues/"); idx > 0 {
+				numPart := rest[idx+len("/issues/"):]
+				if len(numPart) > 0 && !strings.ContainsRune(numPart, '/') {
+					if num, ok := parseFastInt64(numPart); ok {
+						ownerRepo := rest[:idx]
+						if slash := strings.IndexByte(ownerRepo, '/'); slash > 0 && !strings.ContainsRune(ownerRepo[slash+1:], '/') {
+							owner := ownerRepo[:slash]
+							repoName := ownerRepo[slash+1:]
+							repo := st.GetRepo(owner, repoName)
+							if repo == nil {
+								writeErr(w, 404, "Not Found")
+								return
+							}
+							iss := repo.FastGetIssue(num)
+							if iss == nil {
+								writeErr(w, 404, "Not Found")
+								return
+							}
+							if raw := iss.CachedHTTP.Load(); raw != nil {
+								_ = w.WriteRaw(*raw)
+								return
+							}
+							repo.DataMu.RLock()
+							store.RebuildIssueCache(iss)
+							rawPtr := iss.CachedHTTP.Load()
+							repo.DataMu.RUnlock()
+							if rawPtr != nil {
+								_ = w.WriteRaw(*rawPtr)
+								return
+							}
 						}
 					}
 				}
+			}
+		} else if r.Method == "POST" && strings.HasSuffix(rest, "/issues") {
+			ownerRepo := rest[:len(rest)-len("/issues")]
+			if slash := strings.IndexByte(ownerRepo, '/'); slash > 0 && !strings.ContainsRune(ownerRepo[slash+1:], '/') {
+				repo := st.GetRepo(ownerRepo[:slash], ownerRepo[slash+1:])
+				if repo == nil {
+					writeErr(w, 404, "Not Found")
+					return
+				}
+				handleCreateIssueFast(w, r, st, repo)
+				return
 			}
 		}
 	}
@@ -540,7 +555,7 @@ func handleListCommits(w *http1.ResponseWriter, r *http1.Request, repo *store.Re
 		out = append(out, map[string]any{
 			"sha": git.FormatOID(cur),
 			"commit": map[string]any{
-				"message": strings.TrimSuffix(ci.Message, "\n"),
+				"message": git.CommitMessageLocked(repo, cur, ci),
 			},
 		})
 		for _, p := range ci.Parents {
@@ -557,8 +572,12 @@ func handleGetCommit(w *http1.ResponseWriter, repo *store.Repo, shaStr string) {
 	repo.GitMu.RLock()
 	oid, ok := resolveRefLocked(repo, shaStr)
 	var ci *store.CommitInfo
+	var msg string
 	if ok {
 		ci = repo.Commits[oid]
+		if ci != nil {
+			msg = git.CommitMessageLocked(repo, oid, ci)
+		}
 	}
 	repo.GitMu.RUnlock()
 	if !ok || ci == nil {
@@ -568,7 +587,7 @@ func handleGetCommit(w *http1.ResponseWriter, repo *store.Repo, shaStr string) {
 	writeJSONVal(w, 200, map[string]any{
 		"sha": git.FormatOID(oid),
 		"commit": map[string]any{
-			"message": strings.TrimSuffix(ci.Message, "\n"),
+			"message": msg,
 		},
 	})
 }
@@ -905,6 +924,139 @@ func handleCreateLabel(w *http1.ResponseWriter, r *http1.Request, st *store.Stor
 	})
 }
 
+func skipJSONWS(b []byte, i int) int {
+	for i < len(b) {
+		switch b[i] {
+		case ' ', '\t', '\r', '\n':
+			i++
+		default:
+			return i
+		}
+	}
+	return i
+}
+
+func scanPlainJSONString(b []byte, i int) (s []byte, next int, ok bool) {
+	if i >= len(b) || b[i] != '"' {
+		return nil, i, false
+	}
+	i++
+	start := i
+	for i < len(b) {
+		c := b[i]
+		if c == '"' {
+			return b[start:i], i + 1, true
+		}
+		if c == '\\' || c < 0x20 {
+			return nil, i, false
+		}
+		i++
+	}
+	return nil, i, false
+}
+
+func parseCreateIssueFast(body []byte) (title, issueBody string, ok bool) {
+	i := skipJSONWS(body, 0)
+	if i >= len(body) || body[i] != '{' {
+		return "", "", false
+	}
+	i = skipJSONWS(body, i+1)
+	if i >= len(body) {
+		return "", "", false
+	}
+	var tBytes, bBytes []byte
+	var seenTitle, seenBody bool
+
+	if body[i] == '}' {
+		i = skipJSONWS(body, i+1)
+		return "", "", i == len(body)
+	}
+
+	for {
+		key, next, okKey := scanPlainJSONString(body, i)
+		if !okKey {
+			return "", "", false
+		}
+		i = skipJSONWS(body, next)
+		if i >= len(body) || body[i] != ':' {
+			return "", "", false
+		}
+		i = skipJSONWS(body, i+1)
+		val, nextVal, okVal := scanPlainJSONString(body, i)
+		if !okVal {
+			return "", "", false
+		}
+		if bytes.Equal(key, []byte("title")) {
+			if seenTitle {
+				return "", "", false
+			}
+			seenTitle = true
+			tBytes = val
+		} else if bytes.Equal(key, []byte("body")) {
+			if seenBody {
+				return "", "", false
+			}
+			seenBody = true
+			bBytes = val
+		} else {
+			return "", "", false
+		}
+
+		i = skipJSONWS(body, nextVal)
+		if i >= len(body) {
+			return "", "", false
+		}
+		if body[i] == ',' {
+			i = skipJSONWS(body, i+1)
+			continue
+		}
+		if body[i] == '}' {
+			i = skipJSONWS(body, i+1)
+			if i != len(body) {
+				return "", "", false
+			}
+			break
+		}
+		return "", "", false
+	}
+
+	tLen := len(tBytes)
+	total := tLen + len(bBytes)
+	if total == 0 {
+		return "", "", true
+	}
+	var combined string
+	var stack [2048]byte
+	if total <= len(stack) {
+		copy(stack[:tLen], tBytes)
+		copy(stack[tLen:total], bBytes)
+		combined = string(stack[:total])
+	} else {
+		buf := make([]byte, total)
+		copy(buf[:tLen], tBytes)
+		copy(buf[tLen:], bBytes)
+		combined = string(buf)
+	}
+	return combined[:tLen], combined[tLen:], true
+}
+
+func handleCreateIssueFast(w *http1.ResponseWriter, r *http1.Request, st *store.Store, repo *store.Repo) {
+	title, issueBody, ok := parseCreateIssueFast(r.Body)
+	if !ok {
+		handleCreateIssue(w, r, st, repo)
+		return
+	}
+	iss, err := st.CreateIssue(repo, title, issueBody, nil)
+	if err != nil {
+		writeErr(w, 422, "Validation Failed: "+err.Error())
+		return
+	}
+	_ = w.WriteJSONBuild(201, func(dst []byte) []byte {
+		dst = store.MarshalIssueJSON(iss, dst)
+		return append(dst, '\n')
+	})
+}
+
 func handleCreateIssue(w *http1.ResponseWriter, r *http1.Request, st *store.Store, repo *store.Repo) {
 	var req struct {
 		Title  string   `json:"title"`
@@ -920,9 +1072,10 @@ func handleCreateIssue(w *http1.ResponseWriter, r *http1.Request, st *store.Stor
 		writeErr(w, 422, "Validation Failed: "+err.Error())
 		return
 	}
-	buf := store.MarshalIssueJSON(iss, make([]byte, 0, 512))
-	buf = append(buf, '\n')
-	_ = w.WriteJSON(201, buf)
+	_ = w.WriteJSONBuild(201, func(dst []byte) []byte {
+		dst = store.MarshalIssueJSON(iss, dst)
+		return append(dst, '\n')
+	})
 }
 
 func handleListIssues(w *http1.ResponseWriter, r *http1.Request, st *store.Store, repo *store.Repo) {

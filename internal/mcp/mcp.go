@@ -269,7 +269,7 @@ func handleToolCall(w *http1.ResponseWriter, headers []http1.Header, req rpcRequ
 		}
 		toolSuccess(w, headers, req.ID, map[string]any{
 			"id":      iss.ID,
-			"node_id": iss.GlobalID,
+			"node_id": iss.NodeID(),
 			"number":  iss.Number,
 			"title":   iss.Title,
 			"body":    iss.Body,
@@ -297,7 +297,7 @@ func handleToolCall(w *http1.ResponseWriter, headers []http1.Header, req rpcRequ
 		for _, iss := range issues {
 			out = append(out, map[string]any{
 				"id":      iss.ID,
-				"node_id": iss.GlobalID,
+				"node_id": iss.NodeID(),
 				"number":  iss.Number,
 				"title":   iss.Title,
 				"body":    iss.Body,
