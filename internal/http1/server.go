@@ -343,6 +343,28 @@ func (w *ResponseWriter) WriteJSONBuild(status int, buildBody func(dst []byte) [
 	return w.WriteJSON(status, w.bodyBuf)
 }
 
+// WriteJSON201Sized writes a 201 Created application/json response directly into w.buf in a single pass.
+func (w *ResponseWriter) WriteJSON201Sized(bodyLen int, appendBody func(dst []byte) []byte) error {
+	w.wrote = true
+
+	b := w.buf[:0]
+	b = append(b, "HTTP/1.1 201 Created\r\n"...)
+	if w.closeConn {
+		b = append(b, "Connection: close\r\n"...)
+	}
+	b = append(b, "Content-Type: application/json\r\nX-GitHub-Request-Id: 1\r\nContent-Length: "...)
+	b = strconv.AppendInt(b, int64(bodyLen), 10)
+	b = append(b, "\r\n\r\n"...)
+
+	hdrLen := len(b)
+	b = appendBody(b)
+	if len(b)-hdrLen != bodyLen {
+		return w.WriteJSON(201, b[hdrLen:])
+	}
+	w.buf = b
+	return w.sink.writeBytes(b)
+}
+
 // WriteJSONWithHeaders writes an application/json response with custom headers.
 func (w *ResponseWriter) WriteJSONWithHeaders(status int, headers []Header, body []byte) error {
 	return w.WriteResponse(status, "application/json", headers, body)

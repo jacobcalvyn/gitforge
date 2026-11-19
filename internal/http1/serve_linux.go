@@ -1,4 +1,4 @@
-//go:build linux && amd64
+//go:build linux && (amd64 || arm64)
 
 package http1
 
@@ -46,14 +46,6 @@ func rawEpollCtl(epfd, op, fd int, ev *syscall.EpollEvent) syscall.Errno {
 
 func rawAccept4(fd, flags int) (int, syscall.Errno) {
 	r1, _, errno := syscall.RawSyscall6(syscall.SYS_ACCEPT4, uintptr(fd), 0, 0, uintptr(flags), 0, 0)
-	if errno != 0 {
-		return -1, errno
-	}
-	return int(r1), 0
-}
-
-func rawEpollWait0(epfd int, events []syscall.EpollEvent) (int, syscall.Errno) {
-	r1, _, errno := syscall.RawSyscall6(syscall.SYS_EPOLL_WAIT, uintptr(epfd), uintptr(unsafe.Pointer(&events[0])), uintptr(len(events)), 0, 0, 0)
 	if errno != 0 {
 		return -1, errno
 	}
@@ -292,40 +284,17 @@ func (s *Server) Serve(ln net.Listener) error {
 	defer runtime.UnlockOSThread()
 
 	var events [128]syscall.EpollEvent
-	hotPolls := 0
 	for {
-		var n int
-		if hotPolls > 0 && !s.closed.Load() {
-			rn, errno := rawEpollWait0(epfd, events[:])
-			if errno == 0 && rn > 0 {
-				n = rn
-				hotPolls = 4
-			} else if errno == 0 || errno == syscall.EINTR {
-				hotPolls--
-				if hotPolls > 0 {
-					cpuPauseN(350)
-					continue
-				}
-			} else {
-				hotPolls = 0
+		n, err := syscall.EpollWait(epfd, events[:], -1)
+		if err != nil {
+			if err == syscall.EINTR {
+				continue
 			}
-		}
-		if n == 0 {
-			var err error
-			n, err = syscall.EpollWait(epfd, events[:], -1)
-			if err != nil {
-				if err == syscall.EINTR {
-					continue
-				}
-				shutdownAll()
-				if s.closed.Load() {
-					return nil
-				}
-				return err
+			shutdownAll()
+			if s.closed.Load() {
+				return nil
 			}
-			if n > 0 {
-				hotPolls = 4
-			}
+			return err
 		}
 
 		for i := 0; i < n; i++ {
@@ -397,7 +366,7 @@ func (s *Server) Serve(ln net.Listener) error {
 				peerClosed := false
 				readFatal := false
 				rdhup := ev&(syscall.EPOLLHUP|syscall.EPOLLRDHUP) != 0
-				emptySpins := 0
+				bodySpins := 0
 
 				for {
 					if c.state.filled == len(c.state.readBuf) {
@@ -410,7 +379,7 @@ func (s *Server) Serve(ln net.Listener) error {
 					avail := len(c.state.readBuf) - c.state.filled
 					nr, rerr := rawRead(fd, c.state.readBuf[c.state.filled:])
 					if nr > 0 {
-						emptySpins = 0
+						bodySpins = 0
 						c.state.filled += nr
 						if !s.processReadBuffer(&c.state) {
 							c.closeAfterWrite = true
@@ -420,11 +389,13 @@ func (s *Server) Serve(ln net.Listener) error {
 							readFatal = true
 							break
 						}
-						if nr < avail && !rdhup {
-							if n == 1 && len(c.outPending) == 0 && !c.closeAfterWrite && !s.closed.Load() {
-								cpuPauseN(500)
-								continue
+						if c.state.filled > 0 && !rdhup && !c.closeAfterWrite && !s.closed.Load() {
+							if nr < avail {
+								cpuPauseN(150 * archSpinScale)
 							}
+							continue
+						}
+						if nr < avail {
 							break
 						}
 						continue
@@ -437,9 +408,9 @@ func (s *Server) Serve(ln net.Listener) error {
 						continue
 					}
 					if rerr == syscall.EAGAIN || rerr == syscall.EWOULDBLOCK {
-						if emptySpins < 3 && n == 1 && len(c.outPending) == 0 && !c.closeAfterWrite && !rdhup && !s.closed.Load() {
-							emptySpins++
-							cpuPauseN(500)
+						if c.state.filled > 0 && bodySpins < 4 && !rdhup && !c.closeAfterWrite && !s.closed.Load() {
+							bodySpins++
+							cpuPauseN(200 * archSpinScale)
 							continue
 						}
 						break

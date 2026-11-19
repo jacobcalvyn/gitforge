@@ -11,6 +11,9 @@ function selectBinaryName(): string {
   if (process.platform === 'linux' && process.arch === 'x64') {
     return 'forge-linux-amd64';
   }
+  if (process.platform === 'linux' && process.arch === 'arm64') {
+    return 'forge-linux-arm64';
+  }
   if (process.platform === 'darwin' && process.arch === 'arm64') {
     return 'forge-local';
   }

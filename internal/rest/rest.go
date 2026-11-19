@@ -1028,9 +1028,8 @@ func handleCreateIssueFast(w *http1.ResponseWriter, r *http1.Request, st *store.
 		return
 	}
 	iss := st.CreateIssueBytes(repo, titleBytes, bodyBytes)
-	_ = w.WriteJSONBuild(201, func(dst []byte) []byte {
-		dst = store.MarshalIssueJSON(iss, dst)
-		return append(dst, '\n')
+	_ = w.WriteJSON201Sized(store.IssuePlainJSONLen(iss), func(dst []byte) []byte {
+		return store.MarshalIssuePlainJSON(iss, dst)
 	})
 }
 

@@ -901,6 +901,37 @@ func MarshalIssueJSON(iss *Issue, dst []byte) []byte {
 	return append(dst, `]}`...)
 }
 
+// MarshalIssuePlainJSON appends compact issue JSON plus trailing newline without escape scanning
+// for issues already validated to contain plain ASCII characters and no labels.
+func MarshalIssuePlainJSON(iss *Issue, dst []byte) []byte {
+	dst = append(dst, `{"id":`...)
+	dst = strconv.AppendInt(dst, iss.ID, 10)
+	dst = append(dst, `,"number":`...)
+	dst = strconv.AppendInt(dst, iss.Number, 10)
+	dst = append(dst, `,"title":"`...)
+	dst = append(dst, iss.Title...)
+	dst = append(dst, `","body":"`...)
+	dst = append(dst, iss.Body...)
+	return append(dst, `","state":"open","labels":[]}`+"\n"...)
+}
+
+func digits10(n int64) int {
+	if n < 0 {
+		return 1 + digits10(-n)
+	}
+	d := 1
+	for n >= 10 {
+		d++
+		n /= 10
+	}
+	return d
+}
+
+// IssuePlainJSONLen returns the exact byte length produced by MarshalIssuePlainJSON.
+func IssuePlainJSONLen(iss *Issue) int {
+	return 66 + digits10(iss.ID) + digits10(iss.Number) + len(iss.Title) + len(iss.Body)
+}
+
 // RebuildIssueCache pre-builds the complete raw HTTP/1.1 200 OK response for GET /issues/:number.
 func RebuildIssueCache(iss *Issue) {
 	body := MarshalIssueJSON(iss, make([]byte, 0, 256))
