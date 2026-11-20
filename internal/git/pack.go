@@ -121,7 +121,20 @@ func inflatePackEntryInto(r *store.Repo, data []byte, expectedSize int) (out []b
 		if cmf&0x0f == 8 && cmf>>4 <= 7 && ((uint16(cmf)<<8)|uint16(flg))%31 == 0 && flg&0x20 == 0 {
 			sr := sliceReader{b: data[2:]}
 			var fr io.ReadCloser
-			if pooled := flateReaderPool.Get(); pooled != nil {
+			fromPool := r == nil
+			if !fromPool {
+				if r.FlateReader != nil {
+					fr = r.FlateReader.(io.ReadCloser)
+					if err = fr.(flate.Resetter).Reset(&sr, nil); err != nil {
+						_ = fr.Close()
+						fr = flate.NewReader(&sr)
+						r.FlateReader = fr
+					}
+				} else {
+					fr = flate.NewReader(&sr)
+					r.FlateReader = fr
+				}
+			} else if pooled := flateReaderPool.Get(); pooled != nil {
 				fr = pooled.(io.ReadCloser)
 				if err = fr.(flate.Resetter).Reset(&sr, nil); err != nil {
 					_ = fr.Close()
@@ -138,7 +151,9 @@ func inflatePackEntryInto(r *store.Repo, data []byte, expectedSize int) (out []b
 				}
 				if _, err = io.ReadFull(fr, out); err != nil {
 					_ = fr.Close()
-					flateReaderPool.Put(fr)
+					if fromPool {
+						flateReaderPool.Put(fr)
+					}
 					return nil, 0, err
 				}
 			}
@@ -146,14 +161,18 @@ func inflatePackEntryInto(r *store.Repo, data []byte, expectedSize int) (out []b
 			n, rerr := fr.Read(extra[:])
 			if n > 0 || (rerr != nil && rerr != io.EOF) {
 				_ = fr.Close()
-				flateReaderPool.Put(fr)
+				if fromPool {
+					flateReaderPool.Put(fr)
+				}
 				if rerr == nil {
 					return nil, 0, errors.New("inflated pack object larger than declared size")
 				}
 				return nil, 0, rerr
 			}
-			_ = fr.Close()
-			flateReaderPool.Put(fr)
+			if fromPool {
+				_ = fr.Close()
+				flateReaderPool.Put(fr)
+			}
 			if 2+sr.pos+4 > len(data) {
 				return nil, 0, errors.New("zlib trailer truncated")
 			}
@@ -345,7 +364,7 @@ func ParsePackAndStoreLocked(r *store.Repo, pack []byte) error {
 		resolving    bool
 	}
 
-	var stackEntries [16]rawEntry
+	var stackEntries [4]rawEntry
 	var entries []rawEntry
 	if count <= len(stackEntries) {
 		entries = stackEntries[:count]
@@ -465,7 +484,7 @@ func ParsePackAndStoreLocked(r *store.Repo, pack []byte) error {
 			e.resolvedType = baseType
 			e.resolvedData = merged
 		}
-		e.oid = HashObject(e.resolvedType, e.resolvedData)
+		e.oid = HashObjectInto(e.resolvedType, e.resolvedData, &r.HashScratch)
 		e.resolving = false
 		e.done = true
 		if resolvedByOID != nil {
@@ -485,7 +504,7 @@ func ParsePackAndStoreLocked(r *store.Repo, pack []byte) error {
 		} else {
 			e.resolvedType = store.ObjType(e.typeCode)
 			e.resolvedData = e.data
-			e.oid = HashObject(e.resolvedType, e.resolvedData)
+			e.oid = HashObjectInto(e.resolvedType, e.resolvedData, &r.HashScratch)
 		}
 		if _, exists := r.Objects[e.oid]; !exists {
 			r.Objects[e.oid] = r.AllocGitObject(e.resolvedType, e.resolvedData)

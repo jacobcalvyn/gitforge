@@ -52,6 +52,11 @@ func rawAccept4(fd, flags int) (int, syscall.Errno) {
 	return int(r1), 0
 }
 
+func rawSetsockoptOne(fd, level, opt int) {
+	one := int32(1)
+	_, _, _ = syscall.RawSyscall6(syscall.SYS_SETSOCKOPT, uintptr(fd), uintptr(level), uintptr(opt), uintptr(unsafe.Pointer(&one)), 4, 0)
+}
+
 type epollConn struct {
 	fd              int
 	epfd            int
@@ -325,7 +330,7 @@ func (s *Server) Serve(ln net.Listener) error {
 							break
 						}
 					}
-					_ = syscall.SetsockoptInt(nfd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+					rawSetsockoptOne(nfd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY)
 					c := epollConnPool.Get().(*epollConn)
 					c.fd = nfd
 					c.epfd = epfd
@@ -365,8 +370,6 @@ func (s *Server) Serve(ln net.Listener) error {
 			if ev&(syscall.EPOLLIN|syscall.EPOLLERR|syscall.EPOLLHUP|syscall.EPOLLRDHUP) != 0 {
 				peerClosed := false
 				readFatal := false
-				rdhup := ev&(syscall.EPOLLHUP|syscall.EPOLLRDHUP) != 0
-				bodySpins := 0
 
 				for {
 					if c.state.filled == len(c.state.readBuf) {
@@ -379,7 +382,6 @@ func (s *Server) Serve(ln net.Listener) error {
 					avail := len(c.state.readBuf) - c.state.filled
 					nr, rerr := rawRead(fd, c.state.readBuf[c.state.filled:])
 					if nr > 0 {
-						bodySpins = 0
 						c.state.filled += nr
 						if !s.processReadBuffer(&c.state) {
 							c.closeAfterWrite = true
@@ -388,12 +390,6 @@ func (s *Server) Serve(ln net.Listener) error {
 						if c.writeErr {
 							readFatal = true
 							break
-						}
-						if c.state.filled > 0 && !rdhup && !c.closeAfterWrite && !s.closed.Load() {
-							if nr < avail {
-								cpuPauseN(150 * archSpinScale)
-							}
-							continue
 						}
 						if nr < avail {
 							break
@@ -408,11 +404,6 @@ func (s *Server) Serve(ln net.Listener) error {
 						continue
 					}
 					if rerr == syscall.EAGAIN || rerr == syscall.EWOULDBLOCK {
-						if c.state.filled > 0 && bodySpins < 4 && !rdhup && !c.closeAfterWrite && !s.closed.Load() {
-							bodySpins++
-							cpuPauseN(200 * archSpinScale)
-							continue
-						}
 						break
 					}
 					readFatal = true

@@ -343,8 +343,9 @@ func (w *ResponseWriter) WriteJSONBuild(status int, buildBody func(dst []byte) [
 	return w.WriteJSON(status, w.bodyBuf)
 }
 
-// WriteJSON201Sized writes a 201 Created application/json response directly into w.buf in a single pass.
-func (w *ResponseWriter) WriteJSON201Sized(bodyLen int, appendBody func(dst []byte) []byte) error {
+// BeginJSON201 prepares the HTTP/1.1 201 Created response header inside w.buf and
+// returns the buffer along with its header end offset for closure-free body appending.
+func (w *ResponseWriter) BeginJSON201(bodyLen int) ([]byte, int) {
 	w.wrote = true
 
 	b := w.buf[:0]
@@ -355,14 +356,23 @@ func (w *ResponseWriter) WriteJSON201Sized(bodyLen int, appendBody func(dst []by
 	b = append(b, "Content-Type: application/json\r\nX-GitHub-Request-Id: 1\r\nContent-Length: "...)
 	b = strconv.AppendInt(b, int64(bodyLen), 10)
 	b = append(b, "\r\n\r\n"...)
+	return b, len(b)
+}
 
-	hdrLen := len(b)
-	b = appendBody(b)
+// CommitJSON201 finalizes and writes a 201 Created response prepared by BeginJSON201.
+func (w *ResponseWriter) CommitJSON201(b []byte, hdrLen, bodyLen int) error {
 	if len(b)-hdrLen != bodyLen {
 		return w.WriteJSON(201, b[hdrLen:])
 	}
 	w.buf = b
 	return w.sink.writeBytes(b)
+}
+
+// WriteJSON201Sized writes a 201 Created application/json response directly into w.buf in a single pass.
+func (w *ResponseWriter) WriteJSON201Sized(bodyLen int, appendBody func(dst []byte) []byte) error {
+	b, hdrLen := w.BeginJSON201(bodyLen)
+	b = appendBody(b)
+	return w.CommitJSON201(b, hdrLen, bodyLen)
 }
 
 // WriteJSONWithHeaders writes an application/json response with custom headers.
@@ -459,8 +469,11 @@ var (
 )
 
 func findHeaderEnd(buf []byte) (hdrEnd, sepLen int) {
-	idx4 := bytes.Index(buf, crlfcrlf)
-	if idx4 >= 0 {
+	if idx4 := bytes.Index(buf, crlfcrlf); idx4 >= 0 {
+		nl := bytes.IndexByte(buf[:idx4], '\n')
+		if nl < 0 || (nl > 0 && buf[nl-1] == '\r') {
+			return idx4, 4
+		}
 		if idx2 := bytes.Index(buf[:idx4], lflf); idx2 >= 0 {
 			return idx2, 2
 		}
@@ -567,57 +580,70 @@ func (s *Server) parseRequestHeaders(c *connState, hdrBytes []byte) bool {
 			_ = c.w.WriteJSON(400, []byte(`{"message":"Malformed header"}`+"\n"))
 			return false
 		}
-		nameBytes := trimASCIIWhitespace(line[:colon])
-		valBytes := trimASCIIWhitespace(line[colon+1:])
+		nameBytes := line[:colon]
+		if len(nameBytes) > 0 && (isASCIIWS(nameBytes[0]) || isASCIIWS(nameBytes[len(nameBytes)-1])) {
+			nameBytes = trimASCIIWhitespace(nameBytes)
+		}
+		valRaw := line[colon+1:]
+		if len(valRaw) > 0 && valRaw[0] == ' ' {
+			valRaw = valRaw[1:]
+		}
+		valBytes := valRaw
+		if len(valBytes) > 0 && (isASCIIWS(valBytes[0]) || isASCIIWS(valBytes[len(valBytes)-1])) {
+			valBytes = trimASCIIWhitespace(valBytes)
+		}
 
-		switch len(nameBytes) {
-		case 4:
-			if bytesEqualFoldASCII(nameBytes, "Host") {
-				req.Host = b2s(valBytes)
-			}
-		case 6:
-			if bytesEqualFoldASCII(nameBytes, "Expect") && bytesEqualFoldASCII(valBytes, "100-continue") {
-				c.expectContinue = true
-			}
-		case 10:
-			if bytesEqualFoldASCII(nameBytes, "Connection") {
-				if containsFoldASCII(valBytes, "close") {
-					req.Close = true
-				} else if containsFoldASCII(valBytes, "keep-alive") {
-					req.Close = false
+		if len(nameBytes) > 0 {
+			c0 := nameBytes[0] | 0x20
+			switch len(nameBytes) {
+			case 4:
+				if c0 == 'h' && bytesEqualFoldASCII(nameBytes, "Host") {
+					req.Host = b2s(valBytes)
 				}
-			}
-		case 12:
-			if bytesEqualFoldASCII(nameBytes, "Content-Type") {
-				req.ContentType = b2s(valBytes)
-			} else if bytesEqualFoldASCII(nameBytes, "Git-Protocol") {
-				req.GitProtocol = b2s(valBytes)
-			}
-		case 13:
-			if bytesEqualFoldASCII(nameBytes, "Authorization") {
-				req.Auth = b2s(valBytes)
-			}
-		case 14:
-			if bytesEqualFoldASCII(nameBytes, "Content-Length") {
-				cl, err := parsePositiveInt(valBytes)
-				if err != nil || cl < 0 || cl > maxBodyBytes {
-					_ = c.w.WriteJSON(400, []byte(`{"message":"Invalid Content-Length"}`+"\n"))
-					return false
+			case 6:
+				if c0 == 'e' && bytesEqualFoldASCII(nameBytes, "Expect") && bytesEqualFoldASCII(valBytes, "100-continue") {
+					c.expectContinue = true
 				}
-				c.contentLength = cl
-			} else if bytesEqualFoldASCII(nameBytes, "Mcp-Session-Id") {
-				req.MCPSessionID = b2s(valBytes)
+			case 10:
+				if c0 == 'c' && bytesEqualFoldASCII(nameBytes, "Connection") {
+					if containsFoldASCII(valBytes, "close") {
+						req.Close = true
+					} else if containsFoldASCII(valBytes, "keep-alive") {
+						req.Close = false
+					}
+				}
+			case 12:
+				if c0 == 'c' && bytesEqualFoldASCII(nameBytes, "Content-Type") {
+					req.ContentType = b2s(valBytes)
+				} else if c0 == 'g' && bytesEqualFoldASCII(nameBytes, "Git-Protocol") {
+					req.GitProtocol = b2s(valBytes)
+				}
+			case 13:
+				if c0 == 'a' && bytesEqualFoldASCII(nameBytes, "Authorization") {
+					req.Auth = b2s(valBytes)
+				}
+			case 14:
+				if c0 == 'c' && bytesEqualFoldASCII(nameBytes, "Content-Length") {
+					cl, err := parsePositiveInt(valBytes)
+					if err != nil || cl < 0 || cl > maxBodyBytes {
+						_ = c.w.WriteJSON(400, []byte(`{"message":"Invalid Content-Length"}`+"\n"))
+						return false
+					}
+					c.contentLength = cl
+				} else if c0 == 'm' && bytesEqualFoldASCII(nameBytes, "Mcp-Session-Id") {
+					req.MCPSessionID = b2s(valBytes)
+				}
+			case 17:
+				if c0 == 't' && bytesEqualFoldASCII(nameBytes, "Transfer-Encoding") && containsFoldASCII(valBytes, "chunked") {
+					c.chunked = true
+				}
+			case 20:
+				if c0 == 'm' && bytesEqualFoldASCII(nameBytes, "Mcp-Protocol-Version") {
+					req.MCPProtocolVersion = b2s(valBytes)
+				}
+			default:
+				// Unused headers are dropped without heap allocations.
 			}
-		case 17:
-			if bytesEqualFoldASCII(nameBytes, "Transfer-Encoding") && containsFoldASCII(valBytes, "chunked") {
-				c.chunked = true
-			}
-		case 20:
-			if bytesEqualFoldASCII(nameBytes, "Mcp-Protocol-Version") {
-				req.MCPProtocolVersion = b2s(valBytes)
-			}
-		default:
-			// Unused headers are dropped without heap allocations.
 		}
 	}
 
@@ -774,6 +800,10 @@ func (s *Server) dispatch(w *ResponseWriter, r *Request) {
 		}
 	}()
 	s.Handler(w, r)
+}
+
+func isASCIIWS(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\r' || c == '\n'
 }
 
 func trimASCIIWhitespace(b []byte) []byte {

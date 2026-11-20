@@ -180,6 +180,8 @@ type Repo struct {
 	CachedRecvInfoRefs     atomic.Pointer[[]byte]
 	CachedLsRefsDefault    atomic.Pointer[[]byte]
 	CachedShallowClone     atomic.Pointer[ShallowCache]
+	FlateReader            any
+	HashScratch            [2112]byte
 
 	DataMu        sync.RWMutex
 	NextNumber    int64
@@ -189,6 +191,8 @@ type Repo struct {
 	issueSlabOff  int
 	strSlab       []byte
 	strSlabOff    int
+	fastIssueHdrs [2][]*Issue
+	fastIssueIdx  uint8
 	FastIssues    atomic.Pointer[[]*Issue]
 	Pulls         []*PullRequest
 	PullsByNum    map[int64]*PullRequest
@@ -288,19 +292,26 @@ func (r *Repo) FastGetIssue(num int64) *Issue {
 	return sl[num]
 }
 
+// IssueRouteHit caches the most recently fetched issue and its exact request path.
+type IssueRouteHit struct {
+	Path  string
+	Issue *Issue
+}
+
 // Store is the unified thread-safe in-memory data store for the entire forge.
 type Store struct {
-	mu          sync.RWMutex
-	reposMap    atomic.Pointer[map[string]*Repo]
-	lastRepo    atomic.Pointer[Repo]
-	reposByID   map[int64]*Repo
-	repoList    []*Repo
-	issuesByGID map[string]*Issue
-	pullsByGID  map[string]*PullRequest
-	reposByGID  map[string]*Repo
-	nextRepoID  atomic.Int64
-	nextItemID  atomic.Int64
-	seq         atomic.Int64
+	mu           sync.RWMutex
+	reposMap     atomic.Pointer[map[string]*Repo]
+	lastRepo     atomic.Pointer[Repo]
+	LastIssueHit atomic.Pointer[IssueRouteHit]
+	reposByID    map[int64]*Repo
+	repoList     []*Repo
+	issuesByGID  map[string]*Issue
+	pullsByGID   map[string]*PullRequest
+	reposByGID   map[string]*Repo
+	nextRepoID   atomic.Int64
+	nextItemID   atomic.Int64
+	seq          atomic.Int64
 }
 
 // New creates an initialized Store.
@@ -483,12 +494,13 @@ func (s *Store) CreateRepo(owner, name, description string, private bool, defaul
 		Refs:                   make(map[string][20]byte, 8),
 		HEAD:                   "refs/heads/" + defaultBranch,
 		Labels:                 make(map[string]*Label),
-		Issues:                 make([]*Issue, 0, 256),
+		Issues:                 make([]*Issue, 0, 1024),
 		PullsByNum:             make(map[int64]*PullRequest),
 		CachedUploadV2InfoRefs: buildUploadPackV2Advertisement(),
 	}
-	fastInit := make([]*Issue, 1, 256)
-	r.FastIssues.Store(&fastInit)
+	fastInit := make([]*Issue, 1, 1024)
+	r.fastIssueHdrs[0] = fastInit
+	r.FastIssues.Store(&r.fastIssueHdrs[0])
 
 	newMap := make(map[string]*Repo, len(oldMap)+1)
 	for k, v := range oldMap {
@@ -515,6 +527,7 @@ func (s *Store) DeleteRepo(owner, name string) bool {
 		return false
 	}
 	s.lastRepo.Store(nil)
+	s.LastIssueHit.Store(nil)
 	newMap := make(map[string]*Repo, len(oldMap)-1)
 	for k, v := range oldMap {
 		if k != key {
@@ -568,7 +581,7 @@ func (s *Store) CreateLabel(r *Repo, name, color string) (*Label, bool) {
 
 func (r *Repo) allocIssueLocked() *Issue {
 	if r.issueSlabOff >= len(r.issueSlab) {
-		r.issueSlab = make([]Issue, 256)
+		r.issueSlab = make([]Issue, 1024)
 		r.issueSlabOff = 0
 	}
 	iss := &r.issueSlab[r.issueSlabOff]
@@ -630,20 +643,22 @@ func (s *Store) createIssueLocked(r *Repo, title, body string, resolvedLabels []
 	// Grow lock-free lookup slice for O(1) GET /issues/:num hot path (CachedHTTP built lazily on first GET).
 	oldSlice := *r.FastIssues.Load()
 	newLen := int(num) + 1
+	var newSlice []*Issue
 	if newLen <= cap(oldSlice) {
-		newSlice := oldSlice[:newLen]
-		newSlice[num] = iss
-		r.FastIssues.Store(&newSlice)
+		newSlice = oldSlice[:newLen]
 	} else {
 		newCap := cap(oldSlice) * 2
 		if newCap < newLen+16 {
 			newCap = newLen + 16
 		}
-		newSlice := make([]*Issue, newLen, newCap)
+		newSlice = make([]*Issue, newLen, newCap)
 		copy(newSlice, oldSlice)
-		newSlice[num] = iss
-		r.FastIssues.Store(&newSlice)
 	}
+	newSlice[num] = iss
+	idx := r.fastIssueIdx ^ 1
+	r.fastIssueIdx = idx
+	r.fastIssueHdrs[idx] = newSlice
+	r.FastIssues.Store(&r.fastIssueHdrs[idx])
 	return iss
 }
 

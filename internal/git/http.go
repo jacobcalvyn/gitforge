@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"sort"
-	"strconv"
 	"strings"
 
 	"gitforge/internal/http1"
@@ -277,7 +276,7 @@ func buildV0ReceivePackAdvertisement(repo *store.Repo) []byte {
 }
 
 func handleUploadPack(w *http1.ResponseWriter, r *http1.Request, repo *store.Repo) {
-	var pktStack [32]pkt
+	var pktStack [16]pkt
 	pkts, _, err := parsePktLinesInto(r.Body, pktStack[:0], false)
 	if err != nil {
 		_ = w.WriteJSON(400, []byte(`{"message":"Malformed pkt-line"}`+"\n"))
@@ -285,7 +284,7 @@ func handleUploadPack(w *http1.ResponseWriter, r *http1.Request, repo *store.Rep
 	}
 
 	isV2 := strings.Contains(r.GitProtocol, "version=2")
-	var command string
+	var cmdBytes []byte
 	delimIdx := -1
 	for i, p := range pkts {
 		if p.kind == pktKindDelim {
@@ -293,9 +292,9 @@ func handleUploadPack(w *http1.ResponseWriter, r *http1.Request, repo *store.Rep
 			break
 		}
 		if p.kind == pktKindData {
-			line := strings.TrimSuffix(string(p.payload), "\n")
-			if strings.HasPrefix(line, "command=") {
-				command = strings.TrimPrefix(line, "command=")
+			line := bytes.TrimSuffix(p.payload, []byte{'\n'})
+			if bytes.HasPrefix(line, []byte("command=")) {
+				cmdBytes = line[len("command="):]
 				isV2 = true
 			}
 		}
@@ -306,10 +305,10 @@ func handleUploadPack(w *http1.ResponseWriter, r *http1.Request, repo *store.Rep
 		if delimIdx >= 0 {
 			args = pkts[delimIdx+1:]
 		}
-		switch command {
-		case "ls-refs":
+		switch {
+		case bytes.Equal(cmdBytes, []byte("ls-refs")):
 			handleV2LsRefs(w, repo, args)
-		case "fetch":
+		case bytes.Equal(cmdBytes, []byte("fetch")):
 			handleV2Fetch(w, repo, args)
 		default:
 			_ = w.WriteJSON(400, []byte(`{"message":"Unsupported v2 command"}`+"\n"))
@@ -327,16 +326,16 @@ func handleV2LsRefs(w *http1.ResponseWriter, repo *store.Repo, args []pkt) {
 		if p.kind != pktKindData {
 			continue
 		}
-		line := strings.TrimSuffix(string(p.payload), "\n")
+		line := bytes.TrimSuffix(p.payload, []byte{'\n'})
 		switch {
-		case line == "peel":
+		case bytes.Equal(line, []byte("peel")):
 			peel = true
-		case line == "symrefs":
+		case bytes.Equal(line, []byte("symrefs")):
 			symrefs = true
-		case line == "unborn":
+		case bytes.Equal(line, []byte("unborn")):
 			unborn = true
-		case strings.HasPrefix(line, "ref-prefix "):
-			prefixes = append(prefixes, strings.TrimPrefix(line, "ref-prefix "))
+		case bytes.HasPrefix(line, []byte("ref-prefix ")):
+			prefixes = append(prefixes, string(line[len("ref-prefix "):]))
 		}
 	}
 
@@ -418,21 +417,36 @@ type fetchParams struct {
 	done          bool
 }
 
-func parseFetchParams(args []pkt, isV0 bool) (fetchParams, error) {
-	fp := fetchParams{
-		clientShallow: make(map[[20]byte]bool),
+func parseNonNegIntBytes(b []byte) (int, error) {
+	if len(b) == 0 {
+		return 0, errors.New("empty int")
 	}
+	n := 0
+	for _, c := range b {
+		if c < '0' || c > '9' {
+			return 0, errors.New("invalid int")
+		}
+		if n > (int(^uint(0)>>1)-9)/10 {
+			return 0, errors.New("int overflow")
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n, nil
+}
+
+func parseFetchParams(args []pkt, isV0 bool) (fetchParams, error) {
+	var fp fetchParams
 	for _, p := range args {
 		if p.kind != pktKindData {
 			continue
 		}
-		line := strings.TrimSuffix(string(p.payload), "\n")
-		if isV0 && strings.HasPrefix(line, "want ") {
-			rest := strings.TrimPrefix(line, "want ")
-			if sp := strings.IndexByte(rest, ' '); sp >= 0 {
+		line := bytes.TrimSuffix(p.payload, []byte{'\n'})
+		if isV0 && bytes.HasPrefix(line, []byte("want ")) {
+			rest := line[len("want "):]
+			if sp := bytes.IndexByte(rest, ' '); sp >= 0 {
 				rest = rest[:sp]
 			}
-			oid, ok := ParseOID(rest)
+			oid, ok := ParseOIDBytes(rest)
 			if !ok {
 				return fp, errors.New("invalid want oid")
 			}
@@ -440,31 +454,34 @@ func parseFetchParams(args []pkt, isV0 bool) (fetchParams, error) {
 			continue
 		}
 		switch {
-		case strings.HasPrefix(line, "want "):
-			oid, ok := ParseOID(strings.TrimPrefix(line, "want "))
+		case bytes.HasPrefix(line, []byte("want ")):
+			oid, ok := ParseOIDBytes(line[len("want "):])
 			if !ok {
 				return fp, errors.New("invalid want oid")
 			}
 			fp.wants = append(fp.wants, oid)
-		case strings.HasPrefix(line, "have "):
-			oid, ok := ParseOID(strings.TrimPrefix(line, "have "))
+		case bytes.HasPrefix(line, []byte("have ")):
+			oid, ok := ParseOIDBytes(line[len("have "):])
 			if !ok {
 				return fp, errors.New("invalid have oid")
 			}
 			fp.haves = append(fp.haves, oid)
-		case strings.HasPrefix(line, "shallow "):
-			oid, ok := ParseOID(strings.TrimPrefix(line, "shallow "))
+		case bytes.HasPrefix(line, []byte("shallow ")):
+			oid, ok := ParseOIDBytes(line[len("shallow "):])
 			if !ok {
 				return fp, errors.New("invalid shallow oid")
 			}
+			if fp.clientShallow == nil {
+				fp.clientShallow = make(map[[20]byte]bool)
+			}
 			fp.clientShallow[oid] = true
-		case strings.HasPrefix(line, "deepen "):
-			d, err := strconv.Atoi(strings.TrimPrefix(line, "deepen "))
-			if err != nil || d < 0 {
+		case bytes.HasPrefix(line, []byte("deepen ")):
+			d, err := parseNonNegIntBytes(line[len("deepen "):])
+			if err != nil {
 				return fp, errors.New("invalid deepen")
 			}
 			fp.depth = d
-		case line == "done":
+		case bytes.Equal(line, []byte("done")):
 			fp.done = true
 		}
 	}

@@ -3,10 +3,12 @@ package http1
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -175,5 +177,65 @@ func TestFSMFragmentedAndPipelined(t *testing.T) {
 	}
 	if srv.ActivitySeq.Load() != 3 {
 		t.Fatalf("expected ActivitySeq=3, got %d", srv.ActivitySeq.Load())
+	}
+}
+
+func TestConcurrentKeepAlive50(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{
+		Handler: func(w *ResponseWriter, r *Request) {
+			_ = w.WriteGitResponse(200, "application/x-git-upload-pack-result", []byte(r.Path))
+		},
+	}
+	go func() { _ = srv.Serve(ln) }()
+	defer srv.Close(ln)
+
+	const numClients = 50
+	const reqsPerClient = 4
+	errCh := make(chan error, numClients)
+	var wg sync.WaitGroup
+	wg.Add(numClients)
+
+	for c := 0; c < numClients; c++ {
+		go func(id int) {
+			defer wg.Done()
+			conn, err := net.Dial("tcp", ln.Addr().String())
+			if err != nil {
+				errCh <- err
+				return
+			}
+			defer conn.Close()
+			br := bufio.NewReader(conn)
+			for r := 0; r < reqsPerClient; r++ {
+				path := fmt.Sprintf("/c/%d/%d", id, r)
+				req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: localhost\r\n\r\n", path)
+				if _, err := conn.Write([]byte(req)); err != nil {
+					errCh <- err
+					return
+				}
+				resp, err := http.ReadResponse(br, nil)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode != 200 || string(body) != path {
+					errCh <- fmt.Errorf("client %d req %d: got %d %q, want %q", id, r, resp.StatusCode, body, path)
+					return
+				}
+			}
+		}(c)
+	}
+	wg.Wait()
+	close(errCh)
+	for e := range errCh {
+		t.Fatal(e)
+	}
+	if srv.ActivitySeq.Load() != numClients*reqsPerClient {
+		t.Fatalf("expected ActivitySeq=%d, got %d", numClients*reqsPerClient, srv.ActivitySeq.Load())
 	}
 }

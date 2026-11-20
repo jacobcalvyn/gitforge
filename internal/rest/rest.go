@@ -16,6 +16,14 @@ import (
 // HandleREST dispatches all /api/v3/... requests. Authentication is already verified by caller.
 func HandleREST(w *http1.ResponseWriter, r *http1.Request, st *store.Store) {
 	p := r.Path
+	if r.Method == "GET" {
+		if hit := st.LastIssueHit.Load(); hit != nil && hit.Path == p {
+			if raw := hit.Issue.CachedHTTP.Load(); raw != nil {
+				_ = w.WriteRaw(*raw)
+				return
+			}
+		}
+	}
 	// Hot path check first: GET /api/v3/repos/<owner>/<repo>/issues/<number>
 	// and POST /api/v3/repos/<owner>/<repo>/issues.
 	if strings.HasPrefix(p, "/api/v3/repos/") {
@@ -23,10 +31,10 @@ func HandleREST(w *http1.ResponseWriter, r *http1.Request, st *store.Store) {
 		if r.Method == "GET" {
 			if idx := strings.Index(rest, "/issues/"); idx > 0 {
 				numPart := rest[idx+len("/issues/"):]
-				if len(numPart) > 0 && !strings.ContainsRune(numPart, '/') {
+				if len(numPart) > 0 && strings.IndexByte(numPart, '/') < 0 {
 					if num, ok := parseFastInt64(numPart); ok {
 						ownerRepo := rest[:idx]
-						if slash := strings.IndexByte(ownerRepo, '/'); slash > 0 && !strings.ContainsRune(ownerRepo[slash+1:], '/') {
+						if slash := strings.IndexByte(ownerRepo, '/'); slash > 0 && strings.IndexByte(ownerRepo[slash+1:], '/') < 0 {
 							owner := ownerRepo[:slash]
 							repoName := ownerRepo[slash+1:]
 							repo := st.GetRepo(owner, repoName)
@@ -40,6 +48,9 @@ func HandleREST(w *http1.ResponseWriter, r *http1.Request, st *store.Store) {
 								return
 							}
 							if raw := iss.CachedHTTP.Load(); raw != nil {
+								if cur := st.LastIssueHit.Load(); cur == nil || cur.Issue != iss {
+									st.LastIssueHit.Store(&store.IssueRouteHit{Path: string([]byte(p)), Issue: iss})
+								}
 								_ = w.WriteRaw(*raw)
 								return
 							}
@@ -48,6 +59,7 @@ func HandleREST(w *http1.ResponseWriter, r *http1.Request, st *store.Store) {
 							rawPtr := iss.CachedHTTP.Load()
 							repo.DataMu.RUnlock()
 							if rawPtr != nil {
+								st.LastIssueHit.Store(&store.IssueRouteHit{Path: string([]byte(p)), Issue: iss})
 								_ = w.WriteRaw(*rawPtr)
 								return
 							}
@@ -57,7 +69,7 @@ func HandleREST(w *http1.ResponseWriter, r *http1.Request, st *store.Store) {
 			}
 		} else if r.Method == "POST" && strings.HasSuffix(rest, "/issues") {
 			ownerRepo := rest[:len(rest)-len("/issues")]
-			if slash := strings.IndexByte(ownerRepo, '/'); slash > 0 && !strings.ContainsRune(ownerRepo[slash+1:], '/') {
+			if slash := strings.IndexByte(ownerRepo, '/'); slash > 0 && strings.IndexByte(ownerRepo[slash+1:], '/') < 0 {
 				repo := st.GetRepo(ownerRepo[:slash], ownerRepo[slash+1:])
 				if repo == nil {
 					writeErr(w, 404, "Not Found")
@@ -1028,9 +1040,10 @@ func handleCreateIssueFast(w *http1.ResponseWriter, r *http1.Request, st *store.
 		return
 	}
 	iss := st.CreateIssueBytes(repo, titleBytes, bodyBytes)
-	_ = w.WriteJSON201Sized(store.IssuePlainJSONLen(iss), func(dst []byte) []byte {
-		return store.MarshalIssuePlainJSON(iss, dst)
-	})
+	bodyLen := store.IssuePlainJSONLen(iss)
+	b, hdrLen := w.BeginJSON201(bodyLen)
+	b = store.MarshalIssuePlainJSON(iss, b)
+	_ = w.CommitJSON201(b, hdrLen, bodyLen)
 }
 
 func handleCreateIssue(w *http1.ResponseWriter, r *http1.Request, st *store.Store, repo *store.Repo) {

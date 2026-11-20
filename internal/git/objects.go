@@ -79,14 +79,30 @@ func FormatOID(oid [20]byte) string {
 func HashObject(objType store.ObjType, data []byte) [20]byte {
 	if len(data) <= 2048 {
 		var buf [2112]byte
-		b := buf[:0]
-		b = append(b, objType.String()...)
-		b = append(b, ' ')
-		b = strconv.AppendInt(b, int64(len(data)), 10)
-		b = append(b, 0)
-		b = append(b, data...)
-		return sha1.Sum(b)
+		return hashObjectSmall(objType, data, &buf)
 	}
+	return hashObjectLarge(objType, data)
+}
+
+// HashObjectInto computes Git's canonical SHA-1 object ID, reusing scratch when data fits.
+func HashObjectInto(objType store.ObjType, data []byte, scratch *[2112]byte) [20]byte {
+	if len(data) <= 2048 {
+		return hashObjectSmall(objType, data, scratch)
+	}
+	return hashObjectLarge(objType, data)
+}
+
+func hashObjectSmall(objType store.ObjType, data []byte, scratch *[2112]byte) [20]byte {
+	b := scratch[:0]
+	b = append(b, objType.String()...)
+	b = append(b, ' ')
+	b = strconv.AppendInt(b, int64(len(data)), 10)
+	b = append(b, 0)
+	b = append(b, data...)
+	return sha1.Sum(b)
+}
+
+func hashObjectLarge(objType store.ObjType, data []byte) [20]byte {
 	h := sha1Pool.Get().(hash.Hash)
 	h.Reset()
 	var hdr [48]byte
